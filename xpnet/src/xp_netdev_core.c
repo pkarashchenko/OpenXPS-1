@@ -27,8 +27,6 @@
 #define READ_REG    1U
 #define WRITE_REG   0U
 
-#define XPNET_MAX_PACKET_SIZE           (16 << 10)
-#define XPNET_MIN_PACKET_SIZE           (60 + 24)
 #define XPNET_MAX_DMA_SIZE              (4 << 10)
 
 /* RX descriptor and its required bit fields */
@@ -171,24 +169,59 @@ int32_t xp_dev_reg_write_q(xpnet_private_t *net_priv, u32 reg_id,
     return 0;
 }
 
-/* xpnet_set_q_cdp
+/* xpnet_set_tx_q_cdp
  *
  * @xpnet_priv  : xpnet_private structure
- * @q           : the queue to be updated
+ * @q           : the tx_queue to be updated
  * @cdp         : cdp dma address
  *
  * DESC: the cdp is used only if the TX queue is not chained. If chained,
  * the queue's starting descriptor is the cdp and h/w will update it auto-
  * matically.
  */
-static void xpnet_set_q_cdp(xpnet_private_t *net_priv,
-                            xpnet_queue_struct_t *q, int idx, u8 aflags)
+static void xpnet_set_tx_q_cdp(xpnet_private_t *net_priv,
+                            xpnet_tx_queue_struct_t *q, int desc_idx, u8 aflags)
 {
-    u64 base_cdp = (u64) q->dma + (idx * (sizeof(xpnet_descriptor_t)));
-    u32 reg = (q->xpq_type == XPNET_QUEUE_TYPE_TX) ?
-         DMA0_RX_CDP_REG_E :
-         DMA0_TX_CDP_REG_E;
+    u64 base_cdp = 0;
+    u32 reg = DMA0_RX_CDP_REG_E;
 
+    if (q->xpq_type == XPNET_QUEUE_TYPE_RX) {
+        pr_err("Error in %s - Invalid queue type\n", __func__);
+        return;
+    }
+
+    base_cdp = (u64) q->dma +  (desc_idx * (sizeof(xpnet_descriptor_t)));
+    fdebug("Entering %s(), cdp = %016llx\n", __func__, base_cdp);
+
+    (aflags & XPNET_AFLAG_ACQLOCK) ?
+        xp_dev_reg_write_q(net_priv, reg, 2, (u32 *) & base_cdp, q->xpq_id) :
+        __xp_dev_write_q(net_priv, reg, 2, (u32 *) & base_cdp, q->xpq_id);
+}
+
+/* xpnet_set_rx_q_cdp
+ *
+ * @xpnet_priv  : xpnet_private structure
+ * @q           : the rx_queue to be updated
+ * @cdp         : cdp dma address
+ *
+ * DESC: the cdp is used only if the RX queue is not chained. If chained,
+ * the queue's starting descriptor is the cdp and h/w will update it auto-
+ * matically.
+ */
+static void xpnet_set_rx_q_cdp(xpnet_private_t *net_priv,
+                            xpnet_queue_struct_t *q, int desc_idx, u8 aflags)
+{
+    int deschain = XPNET_DESC_CHAIN_INDEX(desc_idx);
+    int deschain_idx = XPNET_DESC_INDEX_IN_CHAIN(desc_idx);
+    u64 base_cdp = 0;
+    u32 reg = DMA0_TX_CDP_REG_E;
+
+    if (q->xpq_type == XPNET_QUEUE_TYPE_TX) {
+        pr_err("Error in %s - Invalid queue type\n", __func__);
+        return;
+    }
+
+    base_cdp = (u64) q->dma + (((deschain * q->xpq_num_desc) + deschain_idx) * (sizeof(xpnet_descriptor_t)));
     fdebug("Entering %s(), cdp = %016llx\n", __func__, base_cdp);
 
     (aflags & XPNET_AFLAG_ACQLOCK) ?
@@ -215,20 +248,22 @@ u64 xpnet_get_q_cdp(xpnet_private_t *net_priv,
     return base_cdp;
 }
 
+
 /*
  * __xpnet_enable_queue
  * @xpnet_priv : xpnet_private structure
- * @q          : queue to be updated in register
+ * @queue_id   : queue to be updated in register
+ * @queue_type : type of queue
  * @enable     : if non zero, enables the queue, else
  *               disables the queue
  * @prio       : if > 8, keeps the priority,
  *               else overwrite with prio
  */
 static void xpnet_queue_en_dis(xpnet_private_t *net_priv,
-                               xpnet_queue_struct_t *q, 
-                               u8 enable, u8 prio, u8 aflags)
+            	u32 queue_id, xpnet_enum_t queue_type,
+                                u8 enable, u8 prio, u8 aflags)
 {
-    u32 reg = (q->xpq_type == XPNET_QUEUE_TYPE_TX) ?
+    u32 reg = (queue_type == XPNET_QUEUE_TYPE_TX) ?
         DMA0_RX_CMD_REG_E :
         DMA0_TX_CMD_REG_E;
     u64 regval;
@@ -244,7 +279,7 @@ static void xpnet_queue_en_dis(xpnet_private_t *net_priv,
 
     /* fdebug("Entering %s(), qid = %d, en %d, flag %d\n",
               __func__, q->xpq_id, enable, aflags); */
-    read_fn(net_priv, reg, 1, (u32 *) &regval, q->xpq_id);
+    read_fn(net_priv, reg, 1, (u32 *) &regval, queue_id);
 
     if (prio > 7) {
         /* If prio > 7, use the existing priority. */
@@ -254,7 +289,35 @@ static void xpnet_queue_en_dis(xpnet_private_t *net_priv,
     /* Enable/disable the queue. */
     regval = (enable) ? XPNET_ENABLE_QUEUE | prio : prio;
     /* fdebug("Writing cmd reg %#x, val %#016llx\n", reg, regval); */
-    write_fn(net_priv, reg, 1, (u32 *) & regval, q->xpq_id);
+    write_fn(net_priv, reg, 1, (u32 *) & regval, queue_id);
+}
+
+/*
+ * __xpnet_enable_queue
+ * @xpnet_priv : xpnet_private structure
+ * @q          : queue for which to check the status
+ *
+ * @return     : [bool] queue is enable or disable
+ */
+static int xpnet_get_queue_status(xpnet_private_t *net_priv,
+                               xpnet_queue_struct_t *q, 
+                               u8 aflags)
+{
+    u32 reg = (q->xpq_type == XPNET_QUEUE_TYPE_TX) ?
+        DMA0_RX_CMD_REG_E :
+        DMA0_TX_CMD_REG_E;
+    u64 regval;
+    reg_rw_func read_fn;
+
+    if (aflags & XPNET_AFLAG_ACQLOCK) {
+        read_fn = xp_dev_reg_read_q;
+    } else {
+        read_fn = __xp_dev_reg_read_q;
+    }
+
+    read_fn(net_priv, reg, 1, (u32 *) &regval, q->xpq_id);
+
+    return (regval & XPNET_ENABLE_QUEUE);
 }
 
 static void reset_mgmt_dma(void)
@@ -271,7 +334,30 @@ static inline void xpnet_rx_desc_enable(xpnet_desc_struct_t *d)
     d->va->qword[0] = regval;
 }
 
-static void xpnet_queue_desc_link(xpnet_queue_struct_t *q, int circular)
+static void xpnet_rx_queue_desc_link(xpnet_queue_struct_t *q, int circular)
+{
+    int next = 0;
+    int n = 0;
+    int deschain = 0;
+
+    /* fdebug("Entering %s()\n", __func__); */
+    /* fdebug("q = %p\n", q); */
+
+    /* Go through descriptors to create a linked list. */
+    for (deschain = 0; deschain < XPNET_DESC_CHAIN_COUNT; deschain++) {
+    	for (n = 0; n < q->xpq_num_desc; n++) {
+    	    next = (n + 1) % q->xpq_num_desc;
+    	    q->xpq_desc_meta[deschain][n].va->qword[3] =
+    	    (u64) q->xpq_desc_meta[deschain][next].cdp;
+    	}
+
+    	if (!circular) {
+    	    q->xpq_desc_meta[deschain][q->xpq_num_desc - 1].va->qword[3] = 0;
+    	}
+    }
+}
+
+static void xpnet_tx_queue_desc_link(xpnet_tx_queue_struct_t *q, int circular)
 {
     int next = 0;
     int n = 0;
@@ -294,13 +380,16 @@ static void xpnet_queue_desc_link(xpnet_queue_struct_t *q, int circular)
 static void xpnet_rx_queue_desc_change_own(xpnet_queue_struct_t *q, int cpu_owns)
 {
     int n = 0;
+    int deschain = 0;
 
     /* fdebug("Entering %s()\n", __func__); */
 
     if (cpu_owns) {
         /* Change the ownership bit of all descriptors of this queue. */
-        for (n = 0; n < q->xpq_num_desc; n++) {
-            xpnet_rx_desc_enable(&q->xpq_desc_meta[n]);
+    	for (deschain = 0; deschain < XPNET_DESC_CHAIN_COUNT; deschain++) {
+            for (n = 0; n < q->xpq_num_desc; n++) {
+                xpnet_rx_desc_enable(&q->xpq_desc_meta[deschain][n]);
+	    	}
         }
     }
 }
@@ -310,7 +399,7 @@ static void xpnet_rx_queue_link_and_enable(xpnet_queue_struct_t *q)
     /* fdebug("Entering %s()\n", __func__); */
 
     /* In case of interrupt enabling, disable pre-empting. */
-    xpnet_queue_desc_link(q, 0);
+    xpnet_rx_queue_desc_link(q, 0);
     xpnet_rx_queue_desc_change_own(q, 1);
     q->head = 0;
     q->tail = 0; /* Indicate init complete. */
@@ -321,16 +410,18 @@ static void xpnet_rx_queue_link_and_enable(xpnet_queue_struct_t *q)
  * Called with q->xpq_lock held
  * Does not set qword[3] to next for chaining
  */
-static int __xpnet_rx_desc_reset(xpnet_queue_struct_t *q, int idx)
+static int __xpnet_rx_desc_reset(xpnet_queue_struct_t *q, int desc_idx)
 {
-    int next = xpnet_add_and_wrap(idx, 1, q->xpq_num_desc);
+    int next = xpnet_add_and_wrap(desc_idx, 1, q->xpq_num_desc);
+    int deschain = XPNET_DESC_CHAIN_INDEX(desc_idx);
+    int deschain_idx = XPNET_DESC_INDEX_IN_CHAIN(desc_idx);
 
     /* fdebug("Entering %s()\n", __func__); */
 
-    q->xpq_desc_meta[idx].va->qword[3] = q->xpq_desc_meta[next].cdp;
-    q->xpq_desc_meta[idx].va->qword[2] = q->xpq_desc_meta[idx].buf_sta.dma;
-    q->xpq_desc_meta[idx].va->qword[1] = XPNET_MAX_PACKET_SIZE;
-    q->xpq_desc_meta[idx].va->qword[0] =
+    q->xpq_desc_meta[deschain][deschain_idx].va->qword[3] = q->xpq_desc_meta[deschain][next].cdp;
+    q->xpq_desc_meta[deschain][deschain_idx].va->qword[2] = q->xpq_desc_meta[deschain][deschain_idx].buf_sta.dma;
+    q->xpq_desc_meta[deschain][deschain_idx].va->qword[1] = XPNET_MAX_PACKET_SIZE;
+    q->xpq_desc_meta[deschain][deschain_idx].va->qword[0] =
         (1 << XP_TX_DESCRIPTOR_BITOFF_OWNERSHIP);
 
     return 0;
@@ -347,6 +438,7 @@ static int __xpnet_rx_desc_reset(xpnet_queue_struct_t *q, int idx)
  */
 static void xpnet_rx_queue_uninit(xpnet_private_t *net_priv, int queue, int meta_idx)
 {
+    int deschain = 0, deschain_idx = 0;
     int i = 0;
     u32 memlen = 
         XPNET_CEIL_LEN((XPNET_RX_NUM_DESCS * XPNET_DESC_SIZE), PAGE_SIZE);
@@ -354,14 +446,17 @@ static void xpnet_rx_queue_uninit(xpnet_private_t *net_priv, int queue, int meta
     xpnet_queue_struct_t *q = &net_priv->rx_queue[queue];
 
     /* fdebug("Entering %s()\n", __func__); */
-    fdebug("Disabling RX queue %d, idx till %d\n", queue, meta_idx);
+    fdebug("Disabling RX queue %d, deschain_idx till %d\n", queue, meta_idx);
 
     /* Disable the queue in the command register. */
-    xpnet_queue_en_dis(net_priv, q, 0, 0, XPNET_AFLAG_ACQLOCK);
+    xpnet_queue_en_dis(net_priv, q->xpq_id, q->xpq_type, 0, 0, XPNET_AFLAG_ACQLOCK);
 
     /* Uninit till failed index. */
     for (i = 0; i < meta_idx; i++) {
-        d = &q->xpq_desc_meta[i];
+    	deschain = XPNET_DESC_CHAIN_INDEX(i);
+    	deschain_idx = XPNET_DESC_INDEX_IN_CHAIN(i);
+
+        d = &q->xpq_desc_meta[deschain][deschain_idx];
         memset(d->va, 0, sizeof(xpnet_descriptor_t));
         d->cdp = 0;
 
@@ -391,21 +486,24 @@ static void xpnet_rx_teardown(xpnet_private_t *net_priv, int failed_idx)
 
     /* fdebug("Entering %s()\n", __func__); */
     for (i = 0; i < failed_idx; i++) {
-        xpnet_rx_queue_uninit(net_priv, i, net_priv->rx_queue[i].xpq_num_desc);
+        xpnet_rx_queue_uninit(net_priv, i, net_priv->rx_queue[i].xpq_num_desc * XPNET_DESC_CHAIN_COUNT);
     }
 }
 
 static int xpnet_rx_desc_init(xpnet_queue_struct_t *q,
-                              int idx, xpnet_shards_struct_t *prealloc)
+                              int desc_idx, xpnet_shards_struct_t *prealloc)
 {
-    xpnet_descriptor_t *d = (xpnet_descriptor_t *)q->dma;
-    xpnet_descriptor_t *v = (xpnet_descriptor_t *)q->va;
-    xpnet_desc_struct_t *desc = &q->xpq_desc_meta[idx];
+    int deschain = XPNET_DESC_CHAIN_INDEX(desc_idx);
+    int deschain_idx = XPNET_DESC_INDEX_IN_CHAIN(desc_idx);
+
+    xpnet_descriptor_t *d = (xpnet_descriptor_t *)(q->dma + (deschain * XPNET_RX_NUM_DESCS * sizeof(xpnet_descriptor_t)));
+    xpnet_descriptor_t *v = (xpnet_descriptor_t *)(q->va + (deschain * XPNET_RX_NUM_DESCS * sizeof(xpnet_descriptor_t)));
+    xpnet_desc_struct_t *desc = &q->xpq_desc_meta[deschain][deschain_idx];
 
     /* fdebug("Entering %s()\n", __func__); */
     desc->num_shards = 0;
-    desc->va = &v[idx];
-    desc->cdp = (dma_addr_t) & d[idx];
+    desc->va = & v[deschain_idx];
+    desc->cdp = (dma_addr_t) & d[deschain_idx];
 
     desc->buf_sta.dma = prealloc->dma;
     desc->buf_sta.len = prealloc->len;
@@ -447,7 +545,7 @@ static int xpnet_rx_queue_init(xpnet_private_t *net_priv, int i)
 {
     xpnet_queue_struct_t *q = NULL;
     u32 memlen = 0;
-    int n = 0, rc = 0;
+    int n = 0, rc = 0, chain = 0;
     xpnet_shards_struct_t prealloc;
 
     /* fdebug("Entering %s()\n", __func__); */
@@ -460,7 +558,7 @@ static int xpnet_rx_queue_init(xpnet_private_t *net_priv, int i)
     /* Start initalizing all queue elements here. */
 
     /* Allocate RX descriptors just for this queue. */
-    memlen = (XPNET_RX_NUM_DESCS * XPNET_DESC_SIZE);
+    memlen = (XPNET_RX_NUM_DESCS * XPNET_DESC_SIZE * XPNET_DESC_CHAIN_COUNT);
     /* fdebug("Required memlen for RX : %#010x bytes\n", memlen); */
     memlen = XPNET_CEIL_LEN(memlen, PAGE_SIZE);
     /*fdebug("Allocated memlen for RX : %#010x bytes\n", memlen); */
@@ -480,22 +578,26 @@ static int xpnet_rx_queue_init(xpnet_private_t *net_priv, int i)
     q->status = XPNET_QUEUE_STOPPED;
     q->tail = 0;
     q->head = 0;
+    q->xpq_deschain_idx = 0;
+    q->xpq_next_deschain_idx = 0;
 
     /* START from here. */
-    for (n = 0; n < q->xpq_num_desc; n++) {
-        if ((rc = xpnet_prealloc_buf(net_priv, &prealloc)) != 0) {
-            /* Free all allocated in this queue before returning. */
-            xpnet_rx_queue_uninit(net_priv, q->xpq_id, n);
-            return rc;
-        }
-        xpnet_rx_desc_init(q, n, &prealloc);
+    for (chain = 0; chain < XPNET_DESC_CHAIN_COUNT; chain++) {
+    	for (n = 0; n < q->xpq_num_desc; n++) {
+    	    if ((rc = xpnet_prealloc_buf(net_priv, &prealloc)) != 0) {
+    	        /* Free all allocated in this queue before returning. */
+    	        xpnet_rx_queue_uninit(net_priv, q->xpq_id, ((chain * q->xpq_num_desc) + n));
+    	        return rc;
+    	    }
+    	    xpnet_rx_desc_init(q, ((chain * q->xpq_num_desc) + n), &prealloc);
+    	}
     }
-
+    
     /* Link and change the ownership bit. */
     xpnet_rx_queue_link_and_enable(q);
 
     /* Set the queue up with current descriptor pointer CDP. */
-    xpnet_set_q_cdp(net_priv, q, 0, XPNET_AFLAG_ACQLOCK);
+    xpnet_set_rx_q_cdp(net_priv, q, 0, XPNET_AFLAG_ACQLOCK);
     /* fdebug("Returning %s()\n", __func__); */
     return 0;
 }
@@ -506,7 +608,7 @@ static int xpnet_rx_all_queues_start(xpnet_private_t *net_priv)
 
     /* fdebug("Entering %s()\n", __func__); */
     for (i = 0; i < net_priv->num_rxqueues; i++) {
-        xpnet_queue_en_dis(net_priv, &net_priv->rx_queue[i], 1, 0,
+        xpnet_queue_en_dis(net_priv, net_priv->rx_queue[i].xpq_id, net_priv->rx_queue[i].xpq_type, 1, 0,
                            XPNET_AFLAG_ACQLOCK);
     }
 
@@ -533,19 +635,19 @@ static int xpnet_rx_queue_setup(xpnet_private_t *net_priv, int num_queues)
 /* Initializes a descriptor (and its meta data in the queue)
  * @xpnet_priv  : xpnet private structure
  * @q           : tx queue
- * @idx         : index that is to be filled
+ * @desc_idx         : index that is to be filled
  */
 static int xpnet_tx_desc_init(xpnet_private_t *net_priv,
-                              xpnet_queue_struct_t *q, int idx)
+                              xpnet_tx_queue_struct_t *q, int desc_idx)
 {
     xpnet_descriptor_t *d = (xpnet_descriptor_t *)q->dma;
     xpnet_descriptor_t *v = (xpnet_descriptor_t *)q->va;
-    xpnet_desc_struct_t *desc = &q->xpq_desc_meta[idx];
+    xpnet_desc_struct_t *desc = &q->xpq_desc_meta[desc_idx];
 
     /* fdebug("Entering %s()\n", __func__); */
     desc->num_shards = 0;
-    desc->va = &v[idx];
-    desc->cdp = (dma_addr_t) & d[idx];
+    desc->va = &v[desc_idx];
+    desc->cdp = (dma_addr_t) & d[desc_idx];
 
     desc->buf_sta.va = dma_alloc_coherent(&net_priv->pdev->dev, PAGE_SIZE,
                                           &(desc->buf_sta.dma), GFP_KERNEL);
@@ -558,7 +660,7 @@ static int xpnet_tx_desc_init(xpnet_private_t *net_priv,
 }
 
 static void xpnet_tx_queue_uninit(xpnet_private_t *net_priv,
-                                  xpnet_queue_struct_t *q, int meta_idx)
+                                  xpnet_tx_queue_struct_t *q, int meta_idx)
 {
     int i = 0;
     u32 memlen = 
@@ -567,7 +669,7 @@ static void xpnet_tx_queue_uninit(xpnet_private_t *net_priv,
 
     /* fdebug("Entering %s()\n", __func__); */
     /* Disable the queue in the command register. */
-    xpnet_queue_en_dis(net_priv, q, 0, 0, XPNET_AFLAG_ACQLOCK);
+    xpnet_queue_en_dis(net_priv, q->xpq_id, q->xpq_type, 0, 0, XPNET_AFLAG_ACQLOCK);
 
     /* Uninit till failed index. */
     for (i = 0; i < meta_idx; i++) {
@@ -593,7 +695,7 @@ static void xpnet_tx_queue_uninit(xpnet_private_t *net_priv,
 
 static int xpnet_tx_queue_init(xpnet_private_t *net_priv, int i)
 {
-    xpnet_queue_struct_t *q = NULL;
+    xpnet_tx_queue_struct_t *q = NULL;
     u32 mem_len;
     int n = 0, rc = 0;
 
@@ -642,18 +744,18 @@ static int xpnet_tx_queue_init(xpnet_private_t *net_priv, int i)
 
     if ((net_priv->hw_flags & XPNET_HWFLAG_A0) == 0) {
         /* HW is not A0, can go ahead and link. */
-        xpnet_queue_desc_link(q, 0);
+        xpnet_tx_queue_desc_link(q, 0);
     }
 
     /* Set the queue up with current descriptor pointer CDP. */
-    xpnet_set_q_cdp(net_priv, q, 0, XPNET_AFLAG_ACQLOCK);
+    xpnet_set_tx_q_cdp(net_priv, q, 0, XPNET_AFLAG_ACQLOCK);
     q->status = XPNET_QUEUE_ACTIVE;
     return XPNET_OK;
 }
 
 static void xpnet_tx_teardown(xpnet_private_t *net_priv, int failed_idx)
 {
-    xpnet_queue_struct_t *q = NULL;
+    xpnet_tx_queue_struct_t *q = NULL;
     /* Teardown from 0 -> failed_idx */
     int i = 0;
 
@@ -713,98 +815,146 @@ static void xpnet_program_mux_setdma(xpnet_private_t *net_priv, u32 flag)
 }
 
 static void xpnet_rx_queue_process(xpnet_private_t *net_priv, 
-                                   int queue, int maxiter)
+            	int queue, int maxiter)
 {
-    int i = 0;
-    unsigned long flags = 0;
-    uint16_t pkt_size = XPNET_MAX_PACKET_SIZE;
-    dma_addr_t dma;
+	unsigned long flags = 0;
+	uint16_t pkt_size = XPNET_MAX_PACKET_SIZE;
+	dma_addr_t dma;
+	xpnet_desc_struct_t *d = NULL;
+	xpnet_queue_struct_t *q = &net_priv->rx_queue[queue];
+	int deschain = 0;
+	struct sk_buff *skb = NULL;
+	/* process_flag will be used to identify if particular chain is ready for processing - if reception completed for chain or not */
+	static unsigned char process_flag = 0;
 
-    xpnet_desc_struct_t *d = NULL;
-    xpnet_queue_struct_t *q = &net_priv->rx_queue[queue];
-    struct sk_buff *skb = NULL;
+	/* fdebug("Entering %s()\n", __func__); */
+	/* Continious interations till the packets are coming - will break on error and exist this function if packets are not available */
+	while(1) {
 
-    /* fdebug("Entering %s()\n", __func__); */
-    /* Iterate through the queue descriptors upto maxiter times. */
-    for (i = 0; i < maxiter; i++) {
-        spin_lock_irqsave(&q->xpq_lock, flags);
-        d = &q->xpq_desc_meta[q->tail];
-        fdebug("Rx tail = %d\n", q->tail);
+            spin_lock_irqsave(&q->xpq_lock, flags);
 
-        /* Check error first. */
-        if ((d->va->qword[0] >> 
-             XP_RX_DESCRIPTOR_BITOFF_ERRORINDICATION) == 1) {
-            fdebug("Dma error. Resetting the descriptor.\n");
-            __xpnet_rx_desc_reset(q, q->tail);
-            xpnet_rx_desc_enable(d);
+            /* If queue disable then set the CDP to next chain and turn the queue on  */	
+            if(!xpnet_get_queue_status(net_priv, q, XPNET_AFLAG_ACQLOCK))
+            {
+                    deschain = q->xpq_next_deschain_idx + 1;
+                    if(deschain >= XPNET_DESC_CHAIN_COUNT)
+                    {
+                        	deschain= 0;
+                    }
 
-            net_priv->stats.rx_dropped++;
-            net_priv->stats.rx_length_errors++;
+                    //In case of multiple chain - Set the next chain for reception, meanwhile scanning can performed parallely on current chain
+                    if(q->xpq_deschain_idx != deschain)
+                    {
+                            if(++(q->xpq_next_deschain_idx) >= XPNET_DESC_CHAIN_COUNT)
+                            {
+                                    q->xpq_next_deschain_idx = 0;
+                            }
+
+                            process_flag = 0;
+                            xpnet_set_rx_q_cdp(net_priv, q, (q->xpq_next_deschain_idx * q->xpq_num_desc), XPNET_AFLAG_ACQLOCK);
+                            xpnet_queue_en_dis(net_priv, q->xpq_id, q->xpq_type, 1, 0, XPNET_AFLAG_ACQLOCK);
+                            pr_info("Descriptor chain changeover - processing chain : %d, receiving chain : %d\n", q->xpq_deschain_idx, q->xpq_next_deschain_idx);
+                    }
+            }
+
+            /* Check if any descriptor chain available for processing */
+            if(process_flag)
+            {
+                    spin_unlock_irqrestore(&q->xpq_lock, flags);
+                    return;
+            }
+
+            d = &q->xpq_desc_meta[q->xpq_deschain_idx][q->tail];
+            fdebug("Rx tail = %d\n", q->tail);
+
+            /* Check error first. */
+            if ((d->va->qword[0] >> 
+                                    XP_RX_DESCRIPTOR_BITOFF_ERRORINDICATION) == 1) {
+                    fdebug("Dma error. Resetting the descriptor.\n");
+                    __xpnet_rx_desc_reset(q, q->tail);
+                    xpnet_rx_desc_enable(d);
+
+                    net_priv->stats.rx_dropped++;
+                    net_priv->stats.rx_length_errors++;
+                    spin_unlock_irqrestore(&q->xpq_lock, flags);
+                    break;
+            }
+
+            /* Check completion if no error. */
+            if ((d->va->qword[0] >> XP_RX_DESCRIPTOR_BITOFF_OWNERSHIP) & 0x01) {
+                    //fdebug("Dma still owns the desc. Rx in progress.\n");
+                    spin_unlock_irqrestore(&q->xpq_lock, flags);
+                    return;
+            }
+
+            /* Received a packet from HW. Set the next packet read delay to 0.
+               It means that may be we have one more packet
+               that should be read immediately. */
+            jiffies_defer = 0;
+
+            /* Process one complete packet : SOP to EOP */
+            dma = d->buf_sta.dma;
+
+            pkt_size = (d->va->qword[1] >> 16) & 0xffff;
+
+            if (net_priv->pci_priv->mode == XP_A0_UNCOMPRESSED) {
+                    pkt_size -= 16;
+            }
+
+            if (pkt_size > XPNET_MAX_PACKET_SIZE) {
+                    __xpnet_rx_desc_reset(q, q->tail);
+                    xpnet_rx_desc_enable(d);
+                    net_priv->stats.rx_dropped++;
+                    spin_unlock_irqrestore(&q->xpq_lock, flags);
+                    break;
+            }
+
+            skb = dev_alloc_skb(pkt_size);
+            if (!skb) {
+                    spin_unlock_irqrestore(&q->xpq_lock, flags);
+                    fdebug("No skb available.\n");
+                    break;
+            }
+
+            __xpnet_endian_swap32(d->buf_sta.va, pkt_size, 
+                        	net_priv->pci_priv->mode);
+
+            memcpy(skb->data, d->buf_sta.va, pkt_size);
+            skb->len = pkt_size;
+
+            /* Reset the length of dma bufffer. */
+            d->va->qword[1] = d->buf_sta.len;
+
+            /* Clear other bits set in the qword[0]. */
+            d->va->qword[0] = (1 << XP_RX_DESCRIPTOR_BITOFF_OWNERSHIP);
+            q->tail = xpnet_add_and_wrap(q->tail, 1, q->xpq_num_desc);
+
+            if (q->tail == 0) {
+                    if(++(q->xpq_deschain_idx) >= XPNET_DESC_CHAIN_COUNT)
+                    {
+                        	q->xpq_deschain_idx = 0;
+                    }
+
+                    fdebug("q->tail == 0, cdp reassign to next chain\n");
+                    if(XPNET_DESC_CHAIN_COUNT == 1)
+                    {
+                        	xpnet_set_rx_q_cdp(net_priv, q, 0, XPNET_AFLAG_ACQLOCK);
+                        	xpnet_queue_en_dis(net_priv, q->xpq_id, q->xpq_type, 1, 0, XPNET_AFLAG_ACQLOCK);
+                    }
+                    else
+                    {
+                        	if(q->xpq_deschain_idx == q->xpq_next_deschain_idx)
+                        	{
+                                    process_flag = 1;
+                        	}
+                    }
+            }
 
             spin_unlock_irqrestore(&q->xpq_lock, flags);
-            return;
-        }
+            xp_rx_skb_process(net_priv, skb);
+	}
 
-        /* Check completion if no error. */
-        if ((d->va->qword[0] >> XP_RX_DESCRIPTOR_BITOFF_OWNERSHIP) & 0x01) {
-            //fdebug("Dma still owns the desc. Rx in progress.\n");
-            spin_unlock_irqrestore(&q->xpq_lock, flags);
-            return;
-        }
-
-        /* Received a packet from HW. Set the next packet read delay to 0.
-           It means that may be we have one more packet
-           that should be read immediately. */
-        jiffies_defer = 0;
-
-        /* Process one complete packet : SOP to EOP */
-        dma = d->buf_sta.dma;
-
-        pkt_size = (d->va->qword[1] >> 16) & 0xffff;
-
-        if (net_priv->pci_priv->mode == XP_A0_UNCOMPRESSED) {
-            pkt_size -= 16;
-        }
-
-        if (pkt_size > XPNET_MAX_PACKET_SIZE) {
-            fdebug("Pkt size error. Resetting the descriptor.\n");
-            __xpnet_rx_desc_reset(q, q->tail);
-            xpnet_rx_desc_enable(d);
-            net_priv->stats.rx_dropped++;
-            spin_unlock_irqrestore(&q->xpq_lock, flags);
-
-            return;
-        }
-
-        skb = dev_alloc_skb(pkt_size);
-        if (!skb) {
-               spin_unlock_irqrestore(&q->xpq_lock, flags);
-               fdebug("No skb available.\n");
-               return;
-        }
-
-        __xpnet_endian_swap32(d->buf_sta.va, pkt_size, 
-                              net_priv->pci_priv->mode);
-        memcpy(skb->data, d->buf_sta.va, pkt_size);
-        skb->len = pkt_size;
-
-        /* Reset the length of dma bufffer. */
-        d->va->qword[1] = d->buf_sta.len;
-
-        /* Clear other bits set in the qword[0]. */
-        d->va->qword[0] = (1 << XP_TX_DESCRIPTOR_BITOFF_OWNERSHIP);
-        q->tail = xpnet_add_and_wrap(q->tail, 1, q->xpq_num_desc);
-
-        if (q->tail == 0) {
-            fdebug("q->tail == 0, cdp resetting\n");
-            /* Lockinig, strictly speaking, not required on RX. */
-            xpnet_set_q_cdp(net_priv, q, 0, XPNET_AFLAG_ACQLOCK);
-            xpnet_queue_en_dis(net_priv, q, 1, 0, XPNET_AFLAG_ACQLOCK);
-        }
-
-        spin_unlock_irqrestore(&q->xpq_lock, flags);
-        xp_rx_skb_process(net_priv, skb);
-    }
+	pr_info("Error Reported in RX Part\n");
 }
 
 static int xpnet_rx_handle(xpnet_private_t *net_priv)
@@ -836,13 +986,13 @@ static int xpnet_rx_handle(xpnet_private_t *net_priv)
  * __xpnet_skb_to_shards
  * Splits the skb to shards
  */
-static int __xpnet_skb_to_shards(struct sk_buff *skb, xpnet_queue_struct_t *q, 
+static int __xpnet_skb_to_shards(struct sk_buff *skb, xpnet_tx_queue_struct_t *q, 
                                  xpnet_private_t *net_priv)
 {
     /* Only the first packet should set SOP, only the last packet
      * should set EOP, length should be a multiple of 8 bytes
      * for all except last. */
-    int copied = 0, n = q->tail, max = skb->len, idx = 0, b2c = 0;
+    int copied = 0, n = q->tail, max = skb->len, desc_idx = 0, b2c = 0;
     xpnet_desc_struct_t *d;
 
     /* fdebug("Entering %s()\n", __func__); */
@@ -865,55 +1015,55 @@ static int __xpnet_skb_to_shards(struct sk_buff *skb, xpnet_queue_struct_t *q,
                               d->buf_sta.len, net_priv->pci_priv->mode);
         copied += b2c;
         n = xpnet_add_and_wrap(n, 1, q->xpq_num_desc);
-        idx++;
+        desc_idx++;
     }
 
-    return idx;
+    return desc_idx;
 }
 
 static int __xpnet_skb_stat_enqueue(xpnet_private_t *net_priv,
-                                    xpnet_queue_struct_t *q, int shards)
+                                    xpnet_tx_queue_struct_t *q, int shards)
 {
-    int idx, max = shards;
+    int desc_idx, max = shards;
     xpnet_desc_struct_t *d = &q->xpq_desc_meta[q->tail];
 
     /* fdebug("Entering %s()\n", __func__); */
     /* Check for space for all shards. */
-    for (idx = q->tail; max > 0; --max) {
-        d = &q->xpq_desc_meta[idx];
+    for (desc_idx = q->tail; max > 0; --max) {
+        d = &q->xpq_desc_meta[desc_idx];
 
         if ((d->va->qword[0] >> XP_TX_DESCRIPTOR_BITOFF_OWNERSHIP) & 0x01) {
             /* At least one element is still busy. */
-            fdebug("Queue busy = %d\n", idx);
+            fdebug("Queue busy = %d\n", desc_idx);
             return XPNET_QUEUE_BUSY;
         }
 
         if ((d->va->qword[0] >> 
              XP_TX_DESCRIPTOR_BITOFF_ERRORINDICATION) & 0x01) {
-            fdebug("Queue error = %d\n", idx);
+            fdebug("Queue error = %d\n", desc_idx);
             /* At least one element of the queue is hosed. */
             return XPNET_QUEUE_ERROR;
         }
 
-        idx = xpnet_add_and_wrap(idx, 1, q->xpq_num_desc);
+        desc_idx = xpnet_add_and_wrap(desc_idx, 1, q->xpq_num_desc);
     }
 
     max = shards;
 
-    for (idx = q->tail; max > 0; --max) {
-        d = &q->xpq_desc_meta[idx];
+    for (desc_idx = q->tail; max > 0; --max) {
+        d = &q->xpq_desc_meta[desc_idx];
         //d->va->qword[3] = 0; /* Will be reset in the next go. */
         d->va->qword[2] = d->buf_sta.dma;
         d->va->qword[1] = d->buf_sta.len;
 
-        if (idx == q->tail) {
+        if (desc_idx == q->tail) {
             /* First element, set SOP only. */
             d->va->qword[0] = (1 << 3);
         } else {
             d->va->qword[0] = (1 << XP_TX_DESCRIPTOR_BITOFF_OWNERSHIP);
         }
 
-        idx = xpnet_add_and_wrap(idx, 1, q->xpq_num_desc);
+        desc_idx = xpnet_add_and_wrap(desc_idx, 1, q->xpq_num_desc);
     }
 
     /* Set EOP for last element. */
@@ -925,9 +1075,9 @@ static int __xpnet_skb_stat_enqueue(xpnet_private_t *net_priv,
     d->va->qword[0] |= (1 << XP_TX_DESCRIPTOR_BITOFF_OWNERSHIP);
 
     if (net_priv->hw_flags & XPNET_HWFLAG_A0) {
-        xpnet_set_q_cdp(net_priv, q, q->tail, 0);
+        xpnet_set_tx_q_cdp(net_priv, q, q->tail, 0);
         /* Do not lock, enable with priority 0. */
-        xpnet_queue_en_dis(net_priv, q, 1, 0, 0);
+        xpnet_queue_en_dis(net_priv, q->xpq_id, q->xpq_type, 1, 0, 0);
     }
 
     return XPNET_OK;
@@ -943,7 +1093,7 @@ static int __xpnet_skb_stat_enqueue(xpnet_private_t *net_priv,
  * chunks of size <= 4kB
  */
 static int __xpnet_enforce_skb_sanity(xpnet_private_t *net_priv,
-                                      xpnet_queue_struct_t *q,
+                                      xpnet_tx_queue_struct_t *q,
                                       struct sk_buff *skb)
 {
     int new_len = 0;
@@ -985,7 +1135,7 @@ static netdev_tx_t xpnet_hard_start_xmit(struct sk_buff *skb,
     int num_free_desc = 0;
     xpnet_enum_t skb_good = 0;
     xpnet_desc_struct_t *d = NULL;
-    xpnet_queue_struct_t *q = &net_priv->tx_queue[txqno];
+    xpnet_tx_queue_struct_t *q = &net_priv->tx_queue[txqno];
 
     /* fdebug("Entering %s()\n", __func__); */
     spin_lock_irqsave(&q->xpq_lock, flags);
@@ -1090,7 +1240,7 @@ static void xpnet_rxtx_handler(struct work_struct *w)
 
     /* Set read packet delay to 1 jiffies.
        The value could be overriden inside xpnet_rx_queue_process(). */
-    jiffies_defer = 1;
+    jiffies_defer = 1; 
 
     /* fdebug("Entering %s()\n", __func__); */
     xpnet_rx_handle(priv);
@@ -1101,7 +1251,7 @@ static void xpnet_rxtx_handler(struct work_struct *w)
 
 static void xpnet_tx_complete(xpnet_private_t *net_priv, int qno, int maxiter)
 {
-    xpnet_queue_struct_t *q = &net_priv->tx_queue[qno];
+    xpnet_tx_queue_struct_t *q = &net_priv->tx_queue[qno];
     xpnet_desc_struct_t *d = NULL;
     int head, tail;
     int iter, busy;
@@ -1191,7 +1341,7 @@ netdev_tx_t xpnet_start_xmit(struct sk_buff *skb, xpnet_private_t *net_priv)
         xpnet_tx_complete(net_priv, net_priv->txqno,
         net_priv->tx_queue[net_priv->txqno].xpq_num_desc);
     }
-    
+   
     /* Move locking from here. */
     spin_unlock_irqrestore(&net_priv->pci_priv->tx_dma_read_lock, flags);
     return rc;
@@ -1337,7 +1487,7 @@ void xp_netdev_deinit(xp_private_t *priv)
         proc_remove(net_priv->proc_root);
 #else
         memset(queue_name, 0, sizeof(queue_name));
-        snprintf(queue_name, sizeof(queue_name) - 1, "xpnet_%d", 
+        snprintf(queue_name, sizeof(queue_name) - 1, "xpnet%d",
                  net_priv->instance);
         remove_proc_entry(queue_name, NULL);
 #endif

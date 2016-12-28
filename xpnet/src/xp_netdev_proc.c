@@ -67,7 +67,7 @@ static int sprint_descriptor(char *buf, int bufsize, void *p, char *msg)
 
 static void dma_stats_dump(xpnet_private_t *net_priv, struct seq_file *sf)
 {
-    seq_printf(sf, "\nRX-TX DMA statstastic\n");
+    seq_printf(sf, "\nRX-TX DMA statistic\n");
     seq_printf(sf, "----------------------------------------------------\n");
     seq_printf(sf, "RX packets:%ld errors:%ld dropped:%ld\n",
                net_priv->stats.rx_packets, net_priv->stats.rx_length_errors, 
@@ -165,7 +165,8 @@ static void common_registers_dump(xpnet_private_t *net_priv,
 static void internal_qstate_dump(xpnet_private_t *net_priv, 
                                  int qno, struct seq_file *sf)
 {
-    xpnet_queue_struct_t *rq = NULL, *tq = NULL;
+    xpnet_queue_struct_t *rq = NULL;
+    xpnet_tx_queue_struct_t *tq = NULL;
     char *type = NULL;
 
     if (qno < XPNET_RX_NUM_QUEUES) {
@@ -242,42 +243,59 @@ static void queue_registers_dump(xpnet_private_t *net_priv, int qno,
 }
 
 static void descriptors_dump(xpnet_private_t *net_priv, char *dest_buf,
-                             int dblen, int qno, xpnet_enum_t rxtx,
-                             struct seq_file *sf)
+				int dblen, int qno, xpnet_enum_t rxtx,
+				struct seq_file *sf)
 {
-    xpnet_descriptor_t *d;
-    xpnet_queue_struct_t *q;
-    char *type;
-    char local[64];
-    int i;
+	xpnet_descriptor_t *d;
+	xpnet_tx_queue_struct_t *txq;
+	xpnet_queue_struct_t *rxq;
+	char *type;
+	char local[64];
+	int i, chain;
 
-    if (rxtx == XPNET_QUEUE_TYPE_TX) {
-        q = (qno >= XPNET_TX_NUM_QUEUES) ? NULL : &net_priv->tx_queue[qno];
-        type = "DSTREAM-TX(host)";
-    } else {
-        q = (qno >= XPNET_RX_NUM_QUEUES) ? NULL : &net_priv->rx_queue[qno];
-        type = "UPSTREAM-RX(host)";
-    }
+	if (rxtx == XPNET_QUEUE_TYPE_TX) {
+			txq = (qno >= XPNET_TX_NUM_QUEUES) ? NULL : &net_priv->tx_queue[qno];
+			type = "DSTREAM-TX(host)";
 
-    if (q == NULL) {
-        sprintf(dest_buf, "Invalid queue %d", qno);
-        return;
-    }
+			if (txq == NULL) {
+					sprintf(dest_buf, "Invalid queue %d", qno);
+					return;
+			}
 
-    seq_printf(sf, "\n%s queue[%d] : #of desc = %d, status = %d\n",
-               type, qno, q->xpq_num_desc, q->status);
+			seq_printf(sf, "\n%s queue[%d] : #of desc = %d, status = %d\n",
+							type, qno, txq->xpq_num_desc, txq->status);
+			seq_printf(sf, "head = %d, tail = %d\n", txq->head, txq->tail);
+			seq_printf(sf, "----------------------------------------------------\n");
 
-    if (q->xpq_type == XPNET_QUEUE_TYPE_TX) {
-        seq_printf(sf, "head = %d, tail = %d\n", q->head, q->tail);
-    }
-    seq_printf(sf, "----------------------------------------------------\n");
+			for (i = 0; i < txq->xpq_num_desc; i++) {
+					d = txq->xpq_desc_meta[i].va;
+					sprintf(local, "%sDESC[%d] : ", type, i);
+					sprint_descriptor(dest_buf, dblen, d, local);
+					seq_printf(sf, "%s\n", dest_buf);
+			}
 
-    for (i = 0; i < q->xpq_num_desc; i++) {
-        d = q->xpq_desc_meta[i].va;
-        sprintf(local, "%sDESC[%d] : ", type, i);
-        sprint_descriptor(dest_buf, dblen, d, local);
-        seq_printf(sf, "%s\n", dest_buf);
-    }
+	} else {
+			rxq = (qno >= XPNET_RX_NUM_QUEUES) ? NULL : &net_priv->rx_queue[qno];
+			type = "UPSTREAM-RX(host)";
+			if (rxq == NULL) {
+					sprintf(dest_buf, "Invalid queue %d", qno);
+					return;
+			}
+
+			seq_printf(sf, "\n%s queue[%d] : #of desc = %d, status = %d\n",
+							type, qno, rxq->xpq_num_desc, rxq->status);
+			seq_printf(sf, "head = %d, tail = %d\n", rxq->head, rxq->tail);
+			seq_printf(sf, "----------------------------------------------------\n");
+
+			for (chain = 0; chain < rxq->xpq_num_desc; chain++) {
+					for (i = 0; i < rxq->xpq_num_desc; i++) {
+							d = rxq->xpq_desc_meta[chain][i].va;
+							sprintf(local, "%sDESC[%d,%d]- : ", type, chain, i);
+							sprint_descriptor(dest_buf, dblen, d, local);
+							seq_printf(sf, "%s\n", dest_buf);
+					}
+			}
+	}
 }
 
 static int xpnet_seq_show_header(xpnet_private_t *priv, struct seq_file *sf)
@@ -526,7 +544,7 @@ int xpnet_proc_create(xpnet_private_t *net_priv)
     
     memset(queue_name, 0, sizeof(queue_name));
     snprintf(queue_name, sizeof(queue_name) - 1, "xpnet%d", net_priv->instance);
-    net_priv->proc_root = proc_mkdir(queue_name, NULL);;
+    net_priv->proc_root = proc_mkdir(queue_name, NULL);
 
     for (count = 0; count < XPNET_NUM_QUEUES; count++) {
         g_net_que_info[count].que_no = count;

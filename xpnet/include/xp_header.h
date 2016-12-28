@@ -27,6 +27,32 @@
 #include <linux/types.h>
 
 /**
+ * \struct _xphTxHdrMetaData__
+ * \brief Fields of Tx metadata in Tx header. Max size is 56 bits
+ *
+ */
+typedef struct __attribute__((__packed__)) _xphTxHdrMetaData__
+{
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    uint8_t rsvd0[1];
+    uint8_t bdId[2];                   /* bdId[0]      bdId[1]
+                                            MSB          LSB   */
+    uint8_t rsvd1[3];
+    uint8_t rsvd2                   :1;
+    uint8_t setBd                   :1;
+    uint8_t rsvd3                   :6;
+#else
+    uint8_t rsvd0[1];
+    uint8_t bdId[2];                   /* bdId[0]      bdId[1]
+                                            MSB          LSB   */
+    uint8_t rsvd1[3];
+    uint8_t rsvd2                   :6;
+    uint8_t setBd                   :1;
+    uint8_t rsvd3                   :1;
+#endif
+} xphTxHdrMetaData;
+
+/**
  * \struct _xphRxHdrMetaData__
  * \brief  Rx metadata in Rx header. Max size is 64 bits.
  */
@@ -74,7 +100,7 @@ typedef struct  __attribute__((__packed__)) _xphTxHdr__
     uint64_t egressVifLsbByte0      :8;  /* LSB of egressVif                 */
 
     uint64_t nextEngine             :8;
-    uint64_t metadata               :56;
+    xphTxHdrMetaData metadata;
 #else
     uint8_t reserved0[8];               /* reserved0[0]   reserved0[7]
                                           MSB                   LSB          */
@@ -94,7 +120,7 @@ typedef struct  __attribute__((__packed__)) _xphTxHdr__
     uint64_t egressVifLsbByte0      :8;  /* LSB of egressVif                 */
 
     uint64_t nextEngine             :8;
-    uint64_t metadata               :56;
+    xphTxHdrMetaData metadata;
 #endif
 } xphTxHdr;
 

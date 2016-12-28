@@ -42,18 +42,57 @@ typedef enum xp_nl_operation {
     XP_NL_OPERATION_DISABLE,
 } xp_nl_operation_t;
 
+/* XP_NL_HOSTIF_TRAP_NETDEV modes in which driver operates.
+ 
+   XP_NL_NETDEV_MODE_1:
+   In this mode a separate kernel netdev is created for each physical or logical
+   interfaces - front pannel ports, LAGs, L3 interfaces, etc. The
+   sending/receiving to/from kernel netdevs is done using a netdev-to-VIF
+   mapping which allows to identify right kernel netdev or hardware(physical or
+   logical) interface the packet has to be sent to in both directions.
+ 
+   XP_NL_NETDEV_MODE_2:
+   In this mode kernel netdevs are created for physical ports only 128 front
+   pannel ports and the CPU port. All the L2 packets(and L3 ones received from
+   router ports) are set to front pannel port netdevs.
+ 
+   The LAG interface is assumed to be represented in kernel by a Linux bond
+   netdev which all its members representing netdevs(front pannel ports netdevs
+   created by this driver) have to be added to. The creation of bond interface
+   and joining/leaving of its members is out of the scope of this packet driver
+   implementation.
+ 
+   The CPU kernel netdev interface serves as an aggregate for L3 VLAN kernel
+   netdevs which are created as VLAN subnetdevs of the CPU netdev. In such case
+   all the packets trapped from hardware and destined to L3 VLANs are sent to
+   the CPU netdev where they are supposed to be demultiplexed using VLAN tags
+   from ethernet headers and Linux kernel facilities. If the driver receives an
+   untagged packet destined to L3 VLAN netdev it adds a corresponding VLAN tag
+   before sending it to the CPU netdev. The packets sent from L3 VLAN
+   netdevs(through the CPU netdev) to hardware are injected to the beginning of
+   the pipeline where they have to be forwarded according to their VLAN headers
+   and pipeline configuartion. The creation/removal of CPU netdev VLAN
+   subnetdevs is out of the scope of this packet driver implementation.*/
+typedef enum xp_nl_netdev_mode {
+    XP_NL_NETDEV_MODE_1,
+    XP_NL_NETDEV_MODE_2,
+} xp_nl_netdev_mode_t;
+
 typedef enum xp_nl_msg {
-    XP_NL_MSG_INTF_ADD,   /* Create a netdev interface     */
-    XP_NL_MSG_INTF_DEL,   /* Remove a netdev interface     */
+    XP_NL_MSG_INTF_ADD,        /* Create a netdev interface     */
+    XP_NL_MSG_INTF_DEL,        /* Remove a netdev interface     */
 
-    XP_NL_MSG_LINK_ADD,   /* Link a netdev with a VIF/RIF  */
-    XP_NL_MSG_LINK_DEL,   /* Remove a netdev VIF/RIF link  */
+    XP_NL_MSG_LINK_ADD,        /* Link a netdev with a VIF/RIF  */
+    XP_NL_MSG_LINK_DEL,        /* Remove a netdev VIF/RIF link  */
 
-    XP_NL_MSG_TX_HDR_SET, /* Add / remove a TX meta header */
-    XP_NL_MSG_TRAP_SET,   /* Add / remove TRAP table entry */
-    XP_NL_MSG_CB_FD_SET,  /* Add / remove FD callback      */
+    XP_NL_MSG_TX_HDR_SET,      /* Add / remove a TX meta header */
+    XP_NL_MSG_TRAP_SET,        /* Add / remove TRAP table entry */
+    XP_NL_MSG_CB_FD_SET,       /* Add / remove FD callback      */
 
-    XP_NL_MSG_MIRROR_SET, /* Enable / disable mirroring    */
+    XP_NL_MSG_MIRROR_SET,      /* Enable / disable mirroring    */
+    XP_NL_MSG_LINK_STATUS_SET, /* Up / Down link status set     */
+    XP_NL_MSG_NETDEV_MODE_SET, /* Set netdev mode to XP_NL_NETDEV_MODE_1 or
+                                  XP_NL_NETDEV_MODE_2 */
 } xp_nl_msg_t;
 
 typedef struct xp_nl_msg_intf {
@@ -93,11 +132,20 @@ typedef struct xp_nl_msg_mirror {
     __u8 operation;
 } xp_nl_msg_mirror_t;
 
+typedef struct xp_nl_msg_link_status {
+    __u32 xpnet_intf_id;
+    __u32 status;
+} xp_nl_msg_link_status_t;
+
 typedef struct xp_nl_tlv_msg {
     __u32 msg_type;    /* xp_nl_msg_t      */
     __u32 payload_len; /* Len of payload[] */
     __u8  payload[];   /* Payload          */
 } xp_nl_tlv_msg_t;
+
+typedef struct xp_nl_msg_netdev_mode {
+    __u8 mode;
+} xp_nl_msg_netdev_mode_t;
 
 #endif /* _XP_EXPORT_H */
 

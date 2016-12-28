@@ -31,11 +31,9 @@
 #include <linux/netdevice.h>
 
 #include "xp_common.h"
-#include "xp_reg_info.h"
 #include "xp_pcie_slave.h"
 #include "xp_header.h"
 #include "xp_netdev.h"
-#include "version.h"
 
 #define VENDOR_ID             0x177D
 #define CNX88091_A0           0xF000
@@ -94,8 +92,7 @@
 #define RX_QUEUE              1
 #define TX_QUEUE              0
 
-#define XPREG_PROC_FILE_NAME "xpregaccess"
-#define XPREG_PROC_FILE_PATH "/proc/" XPREG_PROC_FILE_NAME
+#define SIGNAL_TO_USERSPACE_FOR_PROCESSING	0
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,16,0)
 #define xp_pci_enable_msi_block(a,b) \
@@ -133,7 +130,6 @@ typedef struct __attribute__((__packed__)) xp_mem_info {
 } xp_mem_list_t;
 
 typedef struct xp_work {
-    pid_t app_pid;
     struct siginfo sig_info;
     struct work_struct work;
 } xp_work_t;
@@ -146,13 +142,12 @@ typedef struct xp_dma_private {
 
 typedef struct xp_intr_info {
     u32 reg_type       : 1;
-    u32 block_id       : 8;
     u32 dev_id         : 6;
-    u32 has_queue_info : 1;
+    u32 has_queue_info : 1; /* To verify packetDriver interrupt or not */
     u32 q_type         : 1;
     u32 q_num          : 6;
     u32 intr_status    : 3;
-    u32 r0             : 6; /* Reserved */
+    u32 r0             : 14; /* Reserved */
 } xp_intr_info_t;
 
 /* Read PCIe config space */
@@ -172,6 +167,10 @@ extern int xp_netdev_init(xp_private_t *priv);
 extern void xp_netdev_deinit(xp_private_t *priv);
 #endif 
 
+/* (Default) 0 - send signal to userspace, 1 - store interrupt data in workQueue 
+ * User can override it via command line argument */
+static bool intr_processing_mode = SIGNAL_TO_USERSPACE_FOR_PROCESSING;
+
 /* User can override it via command line argument */
 static bool isr_enable = 1;
 
@@ -183,62 +182,6 @@ static xp_dma_private_t *xp_dma_priv;
 static unsigned int xp_pcidev_major;
 static LIST_HEAD(xp_mem_list_head);
 static struct class *xp_pci_class;
-
-static u8 xp_hp_reg_bit_width[NUM_HP_INT_REG_BLOCKS] = {
-    1, 1, 1,  1,  1, 1,  1, 
-    1, 1, 2, 12,  3, 4,  1, 
-    1, 1, 1,  1, 12, 3,  4, 
-    1, 1, 1,  1,  1, 1, 16, 
-    2, 2, 2, 32,  1, 1,  1
-};
-
-static u8 xp_hp_reg_start_bit[NUM_HP_INT_REG_BLOCKS] = {
-     0,  1,  2,  3,   4,   5,   6, 
-     7,  8,  9, 11,  23,  26,  30, 
-    31, 32, 33, 34,  35,  47,  50, 
-    54, 55, 56, 57,  58,  59,  60, 
-    76, 78, 80, 82, 114, 115, 116
-};
-
-static u8 xp_hp_reg_end_bit[NUM_HP_INT_REG_BLOCKS] = {
-     0,  1,  2,   3,   4,  5,    6, 
-     7,  8, 10,  22,  25, 29,   30, 
-    31, 32, 33,  34,  46, 49,   53, 
-    54, 55, 56,  57,  58, 59,   75, 
-    77, 79, 81, 113, 114, 115, 116
-};
-
-static u8 xp_lp_reg_bit_width[NUM_LP_INT_REG_BLOCKS] = {
-    1, 1, 1, 1, 1,  1, 1,  1, 1, 2, 12, 
-    3, 4, 1, 1, 1,  1, 1, 12, 3, 4,  1, 
-    1, 1, 1, 1, 1, 16, 2,  2, 2, 1,  1
-};
-
-static u8 xp_lp_reg_start_bit[NUM_LP_INT_REG_BLOCKS] = {
-     0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 11, 
-    23, 26, 30, 31, 32, 33, 34, 35, 47, 50, 54, 
-    55, 56, 57, 58, 59, 60, 76, 78, 80, 82, 83
-};
-
-static u8 xp_lp_reg_end_bit[NUM_LP_INT_REG_BLOCKS] = {
-     0,  1,  2,  3,  4,  5,  6,  7,  8, 10, 22, 
-    25, 29, 30, 31, 32, 33, 34, 46, 49, 53, 54, 
-    55, 56, 57, 58, 59, 75, 77, 79, 81, 82, 83
-};
-
-static u32 xp_reg_mask[33] = {
-    0x00000000, 0x00000001, 0x00000003, 
-    0x00000007, 0x0000000f, 0x0000001f, 
-    0x0000003f, 0x0000007f, 0x000000ff, 
-    0x000001ff, 0x000003ff, 0x000007ff, 
-    0x00000fff, 0x00001fff, 0x00003fff, 
-    0x00007fff, 0x0000ffff, 0x0001ffff, 
-    0x0003ffff, 0x0007ffff, 0x000fffff, 
-    0x001fffff, 0x003fffff, 0x007fffff, 
-    0x00ffffff, 0x01ffffff, 0x03ffffff, 
-    0x07ffffff, 0x0fffffff, 0x1fffffff, 
-    0x3fffffff, 0x7fffffff, 0xffffffff
-};
 
 u32 xp_regs_list[XP_MAX_REG_ACCESS_LIST][XP80_SUPPORTED_DEVICE_MODES] =
 {   /* A0-Uncompressed, B0-Uncompressed, B0-Compressed  */
@@ -300,17 +243,37 @@ u32 xp_regs_list[XP_MAX_REG_ACCESS_LIST][XP80_SUPPORTED_DEVICE_MODES] =
     { 0x08b51710, 0x08b5171c, 0x0275031c },
     /* RX_DMA0_SCRATCHPAD_E                             */
     { 0x08b51714, 0x08b51720, 0x02750320 },
-    /* CPU_CTRL_REG_E */
+    /* CPU_CTRL_REG_E                                   */
     { 0x8a80000+0x1f8, 0x8a80000+0x34c, 0x25e8000+0x34c },
-    /* CPU_STS_REG_E */
+    /* CPU_STS_REG_E                                    */
     { 0x8a80000+0x1fc, 0x8a80000+0x350, 0x25e8000+0x350 },
-    /* SRAM_MEM_CFG_SRAM_EXT_MEM_E */
+    /* SRAM_MEM_CFG_SRAM_EXT_MEM_E                      */
     { 0x8800000+0x0, 0x8800000+0x0, 0x24a0000+0x0 },
-
+    /* SLAVE_CHIP_E                                     */
+    { 0x08b52100, 0x08b52100, 0x02758100 },
 };
 
 #define MAX_DEV_SUPPORTED 8
 static xp_private_t *xp_pcie_dev_ptr[MAX_DEV_SUPPORTED];
+
+extern int xp_proc_create(xp_private_t *priv);
+extern int xp_proc_remove(xp_private_t *priv);
+
+static int xp_clear_and_set_pci_capability(struct pci_dev *pdev, int offset, u16 clear, u16 set)
+{
+    u16 val = 0;
+    int ret = -1, pos = 0;
+    pos = pci_find_capability(pdev, PCI_CAP_ID_EXP);
+    if (pos <= 0) {
+        dev_err(&pdev->dev, "Cannot find PCI Express capability, aborting\n");
+        return ret;
+    }
+    ret = pci_read_config_word(pdev, pos + offset, &val);
+    val &= ~clear;
+    val |= set;
+    ret = pci_write_config_word(pdev, pos + offset, val);
+    return ret;
+}
 
 static int xp_driver_version_get(void __user *argp)
 {
@@ -329,6 +292,7 @@ int xp_dev_reg_read(u32 *rw_value, u32 reg_addr,
     switch (reg_size) {
         case BYTE_SIZE:
             for (i = 0; i < count; i++) {
+                priv->reg_read_count++; 
                 rw_value[i] = *((u8*)((uint8_t*)(priv->vma) + reg_addr));
                 reg_addr += reg_size;
                 /* pr_debug("rw_value[i] = %x\n", %d,rw_value[i]); */
@@ -337,6 +301,7 @@ int xp_dev_reg_read(u32 *rw_value, u32 reg_addr,
 
         case WORD_SIZE:
             for (i = 0; i < count; i++) {
+                priv->reg_read_count++; 
                 rw_value[i] = *((u16*)((uint8_t*)(priv->vma) + reg_addr));
                 reg_addr += reg_size;
                 /* pr_debug("rw_value[i] = %x\n", %d,rw_value[i]); */
@@ -345,6 +310,7 @@ int xp_dev_reg_read(u32 *rw_value, u32 reg_addr,
 
         case DWORD_SIZE:
             for (i = 0; i < count; i++) {
+                priv->reg_read_count++; 
                 rw_value[i] = *(u32*)((uint8_t*)(priv->vma) + reg_addr);
                 reg_addr += reg_size;
                 /* pr_debug("rw_value[i] = %x\n", %d,rw_value[i]); */
@@ -379,7 +345,12 @@ int xp_dev_reg_write(u32* rw_value, u32 reg_addr,
     switch (reg_size) {
         case BYTE_SIZE:
             for (i = 0; i < count; i++) {
+                
+                //we need to increment read counter as well since we are doing read-modify-write here
+                priv->reg_read_count++; 
                 value = *(u32*)((uint8_t*)(priv->vma) + reg_addr);
+                
+                priv->reg_write_count++;
                 *(u32*)((uint8_t*)(priv->vma) + reg_addr) = 
                     (value & ~BYTE_MASK ) | (rw_value[i] & BYTE_MASK);
                 /* pr_debug("rw_value[i] = 0x%x\n", rw_value[i] & BYTE_MASK); */
@@ -389,7 +360,12 @@ int xp_dev_reg_write(u32* rw_value, u32 reg_addr,
 
         case WORD_SIZE:
             for (i = 0; i < count; i++) {
+               
+                //we need to increment read counter as well since we are doing read-modify-write here
+                priv->reg_read_count++; 
                 value = *(u32*)((uint8_t*)(priv->vma) + reg_addr);
+                
+                priv->reg_write_count++;
                 *(u32*)((uint8_t*)(priv->vma) + reg_addr) = 
                     (value & ~WORD_MASK) | (rw_value[i] & WORD_MASK);
                 /* pr_debug("rw_value[i] = 0x%x\n", rw_value[i] & WORD_MASK); */
@@ -399,6 +375,7 @@ int xp_dev_reg_write(u32* rw_value, u32 reg_addr,
 
         case DWORD_SIZE:
             for (i = 0; i < count; i++) {
+                priv->reg_write_count++;
                 *(u32*)((uint8_t*)(priv->vma) + reg_addr) = rw_value[i];
                 reg_addr += reg_size;
             }
@@ -414,386 +391,199 @@ int xp_dev_reg_write(u32* rw_value, u32 reg_addr,
     return rc;
 }
 
-
-static void reg_procfs_help(struct seq_file *sf, int minor)
-{
-   if(NULL == sf)
-      return;
-  
-   seq_printf(sf, "\nUsage: echo [OPTIONS] >%s%d; cat %s%d\n\n",
-                   XPREG_PROC_FILE_PATH, minor, XPREG_PROC_FILE_PATH, minor);
-   seq_printf(sf,"1) To read register value.\n"
-                 "\techo r <regoffset> >%s%d; cat %s%d"
-                 "\n\tex1: echo r 0x25e82f4 >%s%d; cat %s%d",
-                 XPREG_PROC_FILE_PATH, minor, XPREG_PROC_FILE_PATH, minor,
-                 XPREG_PROC_FILE_PATH, minor, XPREG_PROC_FILE_PATH, minor);
-   seq_printf(sf,"\n\n2) To write register value.\n"
-                 "\techo w <regoffset> <value> >%s%d; cat %s%d"
-                 "\n\tex1: echo w 0x25e82f4 0x12 >%s%d; cat %s%d",
-                 XPREG_PROC_FILE_PATH, minor, XPREG_PROC_FILE_PATH, minor,
-                 XPREG_PROC_FILE_PATH, minor, XPREG_PROC_FILE_PATH, minor);
-   seq_printf(sf,"\n\n3) To print help.\n"
-                 "\techo help >%s%d; cat %s%d\n",
-                 XPREG_PROC_FILE_PATH, minor, XPREG_PROC_FILE_PATH, minor);
-
-
-}
-
-static int xpreg_seq_show(struct seq_file *sf, void *v)
-{
-    xp_private_t *xp_reg_priv = NULL;
-    xp_reg_priv = sf->private;
-  
-    if (!strnicmp(xp_reg_priv->reg_rw_status, NAME_STR_HELP, sizeof(NAME_STR_HELP) - 1)) {
-       reg_procfs_help(sf, MINOR(xp_reg_priv->cdev.dev));
-    } else if(strlen(xp_reg_priv->reg_rw_status) < 1) {
-       seq_printf(sf, "Invalid input. Please find help as below..");
-       reg_procfs_help(sf, MINOR(xp_reg_priv->cdev.dev));
-    } else {
-       seq_printf(sf, "%s\n", xp_reg_priv->reg_rw_status);
-    }
-
-    return 0;
-}
-
-static int xpreg_seq_open(struct inode *inode, struct file *file)
-{
-    xp_private_t *xp_reg_priv = NULL;
-    struct seq_file *s;
-    int result;
-
-    result = single_open(file, xpreg_seq_show, NULL);
-
-    s = (struct seq_file *)file->private_data;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,0)
-    xp_reg_priv = PDE_DATA(file_inode(file));
-#else
-    xp_reg_priv = PROC_I(inode)->pde->data;
-#endif
-    s->private = xp_reg_priv;
-
-    return result;
-
-}
-
-static ssize_t xpreg_proc_write(struct file *filp, const char *buf,
-                                size_t bufsize, loff_t * off)
-{
-    u32 reg_index=0x0, reg_value=0x0;
-    xp_private_t *xp_reg_priv = NULL;
-    int rc;
-
-    if (bufsize != 0){
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,0)
-          xp_reg_priv = PDE_DATA(file_inode(filp));
-#else
-          struct dentry *dentry = filp->f_path.dentry;
-          struct inode *inode = dentry->d_inode;
-          xp_reg_priv = PROC_I(inode)->pde->data;
-#endif
-         memset(xp_reg_priv->reg_rw_status, 0, 
-                sizeof(xp_reg_priv->reg_rw_status));
-   
-         if (2 == sscanf(buf, "w 0x%x 0x%x", &reg_index, &reg_value)) {
-             rc = xp_dev_reg_write(&reg_value,reg_index, DWORD_SIZE,
-                                  xp_reg_priv, 1);
-             if (rc == -EINVAL) {
-                 snprintf(xp_reg_priv->reg_rw_status,
-                          sizeof(xp_reg_priv->reg_rw_status) - 1,
-                         "Register write failed\n");
-             } else {
-                 snprintf(xp_reg_priv->reg_rw_status, 
-                          sizeof(xp_reg_priv->reg_rw_status) - 1, 
-                         "Write register = 0x%x value = 0x%x\n",
-                          reg_index, reg_value);
-             }
-         } else if(1 == sscanf(buf, "r 0x%x", &reg_index)) {
-             rc = xp_dev_reg_read(&reg_value,reg_index, DWORD_SIZE,
-                                 xp_reg_priv, 1);
-             if (rc == -EINVAL) {
-                 snprintf(xp_reg_priv->reg_rw_status,
-                          sizeof(xp_reg_priv->reg_rw_status) - 1,
-                         "Register read failed\n");
-             } else {
-                 snprintf(xp_reg_priv->reg_rw_status,
-                          sizeof(xp_reg_priv->reg_rw_status) - 1,
-                          "Read register = 0x%x value = 0x%x\n",reg_index,
-                          reg_value);
-             }
-        } else if(!strnicmp(buf, NAME_STR_HELP, sizeof(NAME_STR_HELP) - 1)) {
-                snprintf(xp_reg_priv->reg_rw_status,
-                         sizeof(xp_reg_priv->reg_rw_status) - 1,
-                         "%s", NAME_STR_HELP);
-        }
-    }
-    return bufsize;
-}
-
-static const struct file_operations xpreg_proc_fops = {
-	.owner = THIS_MODULE,
-	.open = xpreg_seq_open,
-	.read = seq_read,
-	.write = xpreg_proc_write,
-	.llseek = seq_lseek,
-	.release = single_release,
-};
-
-struct proc_dir_entry *xpreg_proc_create(const char *root,
-                   struct proc_dir_entry *parent, xp_private_t *data)
-{
-    return  proc_create_data(root, 0644, parent, &xpreg_proc_fops, data);
-}
-
-
-static u32 xp_block_number_get(u32 *reg_value, u32 start_bit, 
-                               u32 end_bit, u8 bit_width)
-{
-    u8 index = 0;
-    u32 mask = 0x1, reg_word_0 = 0x0, 
-        reg_word_1 = 0x0, reg_word_2 = 0x0;
-
-    /* Get the block data. */
-    if ((start_bit / 32) == (end_bit / 32)) {
-        /* If the start bit and end bit are in the same dword then
-         * the bits are in a single dword.
-         */
-        index  = start_bit / 32;
-        reg_word_0 = reg_value[index];
-        reg_word_0 >>= (start_bit % 32);
-
-        if (start_bit != end_bit)
-            mask = xp_reg_mask[bit_width];
-
-        /* else the bit width is 1 so use the default value of mask = 0x1 */
-    } else {
-        /* If the start bit and end bit are in the diffrent dwords then
-         * the bits are in different dwords. They need to be combined to get 
-         * a single word.
-         */
-        reg_word_1 = reg_value[start_bit / 32];
-        reg_word_1 = reg_word_1 >> (start_bit % 32);
-        reg_word_2 = reg_value[end_bit / 32];
-        reg_word_2 = reg_word_2 << (32- (start_bit % 32));
-        reg_word_0 = reg_word_1 | reg_word_2;
-        mask = xp_reg_mask[bit_width];
-    }
-
-    pr_debug("xppci: reg_word_0: 0x%x\n", reg_word_0);
-    return reg_word_0 & mask;
-}
-
 static void xp_task_work_handler(struct work_struct *w)
 {
-    struct task_struct *task = NULL;
     xp_work_t *work = container_of(w, xp_work_t, work);
 
-    if (!work->app_pid) {
-        pr_err("No pid is Registered for SDK.\n");
-        return;
-    }
-
-    pr_debug("Sending event with Interrupt Offset = %d\n", 
+    pr_debug("Processing work with Interrupt Offset = %d\n", 
             work->sig_info.si_int);
-    pr_debug("Application Pid  = %d\n", work->app_pid);
-
-    rcu_read_lock();
-    task = pid_task(find_pid_ns(work->app_pid, &init_pid_ns), PIDTYPE_PID);
-    rcu_read_unlock();
-
-    if (!task) {
-        pr_debug("Get Task for registered PID Fail!\n");
-    } else {
-        if (send_sig_info(XP_RT_SIGNAL, &work->sig_info, task) < 0)
-            pr_debug("Error in sending signal to user.\n");
-    }
 
     kfree((void *)work);
 }
 
-static int xp_irq_handler(xp_private_t *priv, u8 reg_blocks, 
-                          u8 *reg_start_bits, u8 *reg_end_bits, 
-                          u8 *reg_bit_widths, u32 *intr_reg_val)
+static int xp_irq_interrupt_process(xp_private_t *priv, xp_intr_info_t *intr)
 {
-    u32 block_num = 0, start_bit = 0, end_bit = 0, block_value = 0;
     xp_work_t *task = NULL;
-    static xp_intr_info_t intr_info;
+    int rc = 0;
 
-    for (block_num = 0; block_num < reg_blocks; block_num++) {
-        start_bit = reg_start_bits[block_num];
-        end_bit = reg_end_bits[block_num];
+    task = kmalloc(sizeof(xp_work_t), GFP_ATOMIC);
+    if (!task) {
+        pr_err("Failed to allocate memory.\n");
+        return -ENOMEM;
+    }
+    
+    /* Copy intr info to pass it to task handler. */
+    memcpy(&task->sig_info, &priv->sig_info, sizeof(task->sig_info));
+    memcpy(&task->sig_info.si_int, 
+           intr, sizeof(task->sig_info.si_int));
 
-        block_value = xp_block_number_get(intr_reg_val, start_bit, 
-                                          end_bit, reg_bit_widths[block_num]);
-        if (block_value) {
-            memset(&intr_info, 0, sizeof(intr_info));
-            intr_info.block_id = block_num;
-
-            if (reg_blocks == NUM_HP_INT_REG_BLOCKS) {
-                intr_info.reg_type = HIGH;
-            } else {
-                intr_info.reg_type = LOW;
-            }
-
-            intr_info.dev_id = MINOR(priv->cdev.dev);
-
-            task = kmalloc(sizeof(xp_work_t), GFP_ATOMIC);
-            if (!task) {
-                pr_err("Failed to allocate memory.\n");
-                return -ENOMEM;
-            }
-
-            /* Copy intr info to pass it to task handler. */
-            memcpy(&task->sig_info, &priv->sig_info, sizeof(task->sig_info));
-            memcpy(&task->sig_info.si_int, 
-                   &intr_info, sizeof(task->sig_info.si_int));
-            memcpy(&task->app_pid, &priv->app_pid, sizeof(task->app_pid));
-
-            if (priv->w_queue) {
-                INIT_WORK(&task->work, xp_task_work_handler);
-            }
-
-            pr_debug("block_num : %d\n", block_num);
-            pr_debug("Interrupt generated for block: %x\n", 
-                     task->sig_info.si_int);
-            queue_work(priv->w_queue, &task->work);
+    /* Check weather processing will be performed in kernel-space or user-space */
+    if (intr_processing_mode != SIGNAL_TO_USERSPACE_FOR_PROCESSING) {
+        if (!priv->w_queue) {
+            pr_err("Unable to find workQueue\n");
+            return -ENODATA;
         }
+
+        INIT_WORK(&task->work, xp_task_work_handler);
+        queue_work(priv->w_queue, &task->work);
+        pr_debug("Creating work with Interrupt Offset = %d\n", 
+                task->sig_info.si_int);
+    }
+    else {
+        if (!priv->wtask) {
+            pr_err("Unable to send signal as task struct is invalid for Pid - %d\n", priv->app_pid);
+            return -ENODATA;
+        }
+
+        rc = send_sig_info(XP_RT_SIGNAL, &task->sig_info, priv->wtask);
+        if (rc < 0) {
+            pr_err("Error in sending signal to user.\n");
+            return rc;
+        }
+
+        pr_debug("Application Pid - %d, Sending event with Interrupt Offset = %d\n", 
+                priv->app_pid, task->sig_info.si_int);
     }
 
-    return 0;
+    return rc;
 }
 
-static int xp_irq_mgmt_handler(xp_private_t *priv)
+static int xp_irq_mgmt_handler(xp_private_t *priv, xp_intr_info_t *intr_info)
 {
+    int rc = 0;
     u8 i = 0, j = 0, bit_pos = 0;
     u32 high_intr_src_reg[HIGH_INTR_SRC_REG_SIZE], status_reg_addr = 0, queue_bit_map = 0;
     u32 intr_status = 0;
-    xp_work_t *task = NULL;
+    u32 reg_value = 0;
     unsigned long flags = 0;
 
-    static xp_intr_info_t intr_info;
+    memset(high_intr_src_reg, 0, sizeof(u32) * HIGH_INTR_SRC_REG_SIZE);
+    rc = xp_dev_reg_read(high_intr_src_reg, 
+                        XP_GET_PCI_BASE_OFFSET_FROM_REG_NAME(HIGH_INTR_SOURCE_REG_ADDR, 
+                        priv->mode), DWORD_SIZE, priv, HIGH_INTR_SRC_REG_SIZE);
+    if(rc < 0) {
+        pr_err("%s: Register read failed\n", __func__);
+        return rc;
+    }
 
-    memset(&intr_info, 0, sizeof(intr_info));
-
+    /* Note: MGMT interrupts are supported for high priority only */
     for (i = 0; i < HIGH_INTR_SRC_REG_SIZE; i++) {
-        high_intr_src_reg[i] = 0; /* Clear the values for older interrupts. */
-        spin_lock_irqsave(&priv->tx_dma_read_lock, flags);
-        high_intr_src_reg[i] = 
-            *((u32*)((uint8_t*)(priv->vma) + 
-            XP_GET_PCI_BASE_OFFSET_FROM_REG_NAME(HIGH_INTR_SOURCE_REG_ADDR, 
-                                                 priv->mode)) + i); 
-        spin_unlock_irqrestore(&priv->tx_dma_read_lock, flags);
-
         if (high_intr_src_reg[i]) {
-            /* Get the queue number only if the bit in this register is set. */
-            if (i == 0) {
-                j = DMA0_INTR_START_BIT_POS(priv->mode);
-            } else {
-                j = 0;
-            }
+            do
+            {
+                /* Get the queue number only if a bit in this register is set. */
+                if (i == 0) {
+                    /* Check if mgmt interrupt is reported for other than DMA0 */
+                    if (high_intr_src_reg[i] & MGMT_INTR_BLOCK_MASK(priv->mode)) {
+                        memset(intr_info, 0, sizeof(xp_intr_info_t));
+                        intr_info->dev_id = MINOR(priv->cdev.dev);
+                        intr_info->reg_type = HIGH;
 
-            for(; j < (sizeof(u32) * 8); j++) {
-                /* Check for any  dma0 RX/TX interrupt bit enable or not. */
-                if ((high_intr_src_reg[i] >> j) & 0x1) {
-                    intr_info.has_queue_info = 1; 
-                    break;
+                        rc = xp_irq_interrupt_process(priv, intr_info);
+                        if (rc < 0) {
+                            pr_err("ERR: Could not handle mgmt interrupt.\n");
+                            return rc;
+                        }
+
+                        priv->intr_high_prio_block_counter++;
+                        pr_debug("MGMT Block Interrupt Reported\n"); 
+                    }
+                    j = DMA0_INTR_START_BIT_POS(priv->mode);
+                } else {
+                    j = 0;
                 }
-            }
-        }
 
-        if (intr_info.has_queue_info) {
-            /* Calculate bit position. */
-            bit_pos = (i * 32) + j; 
+                memset(intr_info, 0, sizeof(xp_intr_info_t));
+                for(; j < (sizeof(u32) * 8); j++) {
+                    /* Check for any  dma0 RX/TX interrupt bit enable or not. */
+                    reg_value = (high_intr_src_reg[i] >> j);
+                    if (reg_value & 0x1) {
+                        intr_info->has_queue_info = 1; 
+                        reg_value = reg_value >> 1;
+                        break;
+                    }
+                }
 
-            if (bit_pos >= DMA0_INTR_START_BIT_POS(priv->mode) &&
-                bit_pos < (TOTAL_RX_QUEUE + DMA0_INTR_START_BIT_POS(priv->mode))) {
-                intr_info.q_num = bit_pos - DMA0_INTR_START_BIT_POS(priv->mode);
-                intr_info.q_type = RX_QUEUE;
-            } else if (bit_pos >= (TOTAL_TX_QUEUE + DMA0_INTR_START_BIT_POS(priv->mode)) &&
-                       bit_pos < (DMA0_INTR_START_BIT_POS(priv->mode) +
-                                  TOTAL_RX_QUEUE + TOTAL_TX_QUEUE)) {
-                intr_info.q_num = bit_pos -
-                    (TOTAL_TX_QUEUE + DMA0_INTR_START_BIT_POS(priv->mode));
-                intr_info.q_type = TX_QUEUE;
-            }
+                if (intr_info->has_queue_info) {
+                    /* Calculate bit position. */
+                    bit_pos = (i * 32) + j; 
 
-            intr_info.block_id = 0;
-            intr_info.dev_id = MINOR(priv->cdev.dev);
+                    if (bit_pos >= DMA0_INTR_START_BIT_POS(priv->mode) &&
+                        bit_pos < (TOTAL_RX_QUEUE + DMA0_INTR_START_BIT_POS(priv->mode))) {
+                        intr_info->q_num = bit_pos - DMA0_INTR_START_BIT_POS(priv->mode);
+                        intr_info->q_type = RX_QUEUE;
+                    } else if (bit_pos >= (TOTAL_TX_QUEUE + DMA0_INTR_START_BIT_POS(priv->mode)) &&
+                               bit_pos < (DMA0_INTR_START_BIT_POS(priv->mode) +
+                                          TOTAL_RX_QUEUE + TOTAL_TX_QUEUE)) {
+                        intr_info->q_num = bit_pos -
+                            (TOTAL_TX_QUEUE + DMA0_INTR_START_BIT_POS(priv->mode));
+                        intr_info->q_type = TX_QUEUE;
+                    }
 
-            if (intr_info.q_type == RX_QUEUE) {
-                status_reg_addr = 
-                    DMA0_RXDONE(XP_GET_PCI_BASE_OFFSET_FROM_REG_NAME(
-                       DMA0_RXDONE_STATUS_REG, priv->mode), 
-                                intr_info.q_num);
-            } else {
-                status_reg_addr = 
-                    DMA0_TXDONE(XP_GET_PCI_BASE_OFFSET_FROM_REG_NAME(
-                       DMA0_TXDONE_STATUS_REG, priv->mode), 
-                                intr_info.q_num);
-            }
-                        
-            spin_lock_irqsave(&priv->tx_dma_read_lock, flags);
-            intr_status = *(u32*)((uint8_t*)(priv->vma) + status_reg_addr);
-            spin_unlock_irqrestore(&priv->tx_dma_read_lock, flags);
-            intr_info.intr_status = intr_status;
+                    if (intr_info->q_type == RX_QUEUE) {
+                        status_reg_addr = 
+                            DMA0_RXDONE(XP_GET_PCI_BASE_OFFSET_FROM_REG_NAME(
+                               DMA0_RXDONE_STATUS_REG, priv->mode), 
+                                        intr_info->q_num);
+                        pr_debug("MGMT DMA0 Interrupt Reported For Rx Queue Number - %d\n", intr_info->q_num); 
+                    } else {
+                        status_reg_addr = 
+                            DMA0_TXDONE(XP_GET_PCI_BASE_OFFSET_FROM_REG_NAME(
+                               DMA0_TXDONE_STATUS_REG, priv->mode), 
+                                        intr_info->q_num);
+                        pr_debug("MGMT DMA0 Interrupt Reported For Tx Queue Number - %d\n", intr_info->q_num); 
+                    }
+                                
+                    spin_lock_irqsave(&priv->tx_dma_read_lock, flags);
+                    intr_status = *(u32*)((uint8_t*)(priv->vma) + status_reg_addr);
+                    spin_unlock_irqrestore(&priv->tx_dma_read_lock, flags);
+                    intr_info->intr_status = intr_status;
 
-            task = kmalloc(sizeof(xp_work_t), GFP_ATOMIC);
-            if (!task) {
-                pr_err("Failed to allocate memory.\n");
-                return -ENOMEM;
-            }
+                    intr_info->dev_id = MINOR(priv->cdev.dev);
+                    intr_info->reg_type = HIGH;
+                    rc = xp_irq_interrupt_process(priv, intr_info);
+                    if (!rc) {
+                        priv->intr_high_prio_mgmt_counter++;
+                    }
 
-            /* Copy intr info to pass it to task handler. */
-            memcpy(&task->sig_info, &priv->sig_info, sizeof(task->sig_info));
-            memcpy(&task->sig_info.si_int, 
-                   &intr_info, sizeof(task->sig_info.si_int));
-            memcpy(&task->app_pid, &priv->app_pid, sizeof(task->app_pid));
-
-            if (priv->w_queue) {
-                INIT_WORK(&task->work, xp_task_work_handler);
-            }
-
-            queue_work(priv->w_queue, &task->work);
-            intr_status = 0x7; /* Clear all interrupts. */
-            xp_dev_reg_write(&intr_status, status_reg_addr, 1, priv, 1);
-            queue_bit_map = 1 << j;
-            xp_dev_reg_write(&queue_bit_map, 
-                             XP_GET_PCI_BASE_OFFSET_FROM_REG_NAME(
-                             HIGH_INTR_SOURCE_REG_ADDR, priv->mode) + 
-                             (i * 4), 4, priv, 1);
-            break;
+                    intr_status = 0x7; /* Clear all interrupts. */
+                    xp_dev_reg_write(&intr_status, status_reg_addr, 1, priv, 1);
+                    queue_bit_map = 1 << j;
+                    xp_dev_reg_write(&queue_bit_map, 
+                                     XP_GET_PCI_BASE_OFFSET_FROM_REG_NAME(
+                                     HIGH_INTR_SOURCE_REG_ADDR, priv->mode) + 
+                                     (i * 4), 4, priv, 1);
+                }
+            } while(reg_value); /* Scan if any other non zero bit is available */
         }
     }
 
-    return 0;
+    return rc;
 }
 
 static irqreturn_t xp_msi_irq_handler_high(int irq, void *data)
 {
     int rc = 0;
-    int i = 0;
     u32 reg_value[4];
-    unsigned long flags = 0;
     xp_private_t *priv = (xp_private_t *)data;
+    xp_intr_info_t intr_info;
 
     pr_debug("XP80:%s:Interrupt handler at %d, "
             "irq: %d\n", __func__, __LINE__, irq);
 
-    for (i = 0; i < XP_HP_INT_REG_SIZE_IN_DWRD; i++) {
-        reg_value[i] = 0; /* Clear the values for older interrupts. */
-        spin_lock_irqsave(&priv->tx_dma_read_lock, flags);
-
-        reg_value[i] = *((u32*)((uint8_t*)(priv->vma) + 
-            XP_GET_PCI_BASE_OFFSET_FROM_REG_NAME(HIGH_PRIO_REG_ADDR, 
-                                                 priv->mode)) + i);
-
-        spin_unlock_irqrestore(&priv->tx_dma_read_lock, flags);
+    rc = xp_dev_reg_read(reg_value, XP_GET_PCI_BASE_OFFSET_FROM_REG_NAME(HIGH_PRIO_REG_ADDR, 
+                        priv->mode), DWORD_SIZE, priv, XP_HP_INT_REG_SIZE_IN_DWRD);
+    if(rc < 0) {
+        pr_err("%s: Register read failed\n", __func__);
+        return IRQ_NONE;
     }
 
     /* Bit 116 in high priority register indicates mgmt block. */
     if (reg_value[3] & 0x100000) {
-        rc = xp_irq_mgmt_handler(priv);
+        rc = xp_irq_mgmt_handler(priv, &intr_info);
         if (rc < 0) {
-            return rc;
+            pr_err("ERR: Could not handle high prioirty mgmt interrupt.\n");
+            return IRQ_NONE;
         } else {
             return IRQ_HANDLED;
         }
@@ -803,14 +593,17 @@ static irqreturn_t xp_msi_irq_handler_high(int irq, void *data)
         (reg_value[2] == 0) & (reg_value[3] == 0)) {
         return IRQ_HANDLED;
     } else {
-        /* Handle interrupts only if the high priority 
-           interrupt summary register has non-zero value. */
-        rc = xp_irq_handler(priv, NUM_HP_INT_REG_BLOCKS, xp_hp_reg_start_bit, 
-                            xp_hp_reg_end_bit, xp_hp_reg_bit_width, reg_value);
+        memset(&intr_info, 0, sizeof(intr_info));
+        intr_info.dev_id = MINOR(priv->cdev.dev);
+        intr_info.reg_type = HIGH;
+
+        /* Process reported high priority interrupt */
+        rc = xp_irq_interrupt_process(priv, &intr_info);
         if (rc < 0) {
             pr_err("ERR: Could not handle high prioirty interrupts.\n");
-            return -1;
+            return IRQ_NONE;
         }
+        priv->intr_high_prio_block_counter++;
     }
 
     return IRQ_HANDLED;
@@ -819,30 +612,26 @@ static irqreturn_t xp_msi_irq_handler_high(int irq, void *data)
 static irqreturn_t xp_msi_irq_handler_low(int irq, void *data)
 {
     int rc = 0;
-    int i = 0;
     u32 reg_value[4];
-    unsigned long flags = 0;
     xp_private_t *priv = (xp_private_t *)data;
+    xp_intr_info_t intr_info;
 
     pr_debug("XP80:%s:Interrupt handler at %d, "
             "irq: %d\n", __func__, __LINE__, irq);
 
-    for (i = 0; i < XP_LP_INT_REG_SIZE_IN_DWRD; i++) {
-        reg_value[i] = 0; /* Clear the values for older interrupts. */
-        spin_lock_irqsave(&priv->tx_dma_read_lock, flags);
-
-        reg_value[i] = *((u32*)((uint8_t*)(priv->vma) + 
-            XP_GET_PCI_BASE_OFFSET_FROM_REG_NAME(LOW_PRIO_REG_ADDR, 
-                                                 priv->mode)) + i);
-
-        spin_unlock_irqrestore(&priv->tx_dma_read_lock, flags);
+    rc = xp_dev_reg_read(reg_value, XP_GET_PCI_BASE_OFFSET_FROM_REG_NAME(LOW_PRIO_REG_ADDR, 
+                        priv->mode), DWORD_SIZE, priv, XP_LP_INT_REG_SIZE_IN_DWRD);
+    if(rc) {
+        pr_err("%s: Register read failed\n", __func__);
+        return IRQ_NONE;
     }
 
     /* Bit 83 in low priority register indicates mgmt block. */
     if(reg_value[2] & 0x80000) {
-        rc = xp_irq_mgmt_handler(priv);
+        rc = xp_irq_mgmt_handler(priv, &intr_info);
         if (rc < 0) {
-            return -1;
+            pr_err("ERR: Could not handle low prioirty mgmt interrupt.\n");
+            return IRQ_NONE;
         } else {
             return IRQ_HANDLED;
         }
@@ -852,11 +641,17 @@ static irqreturn_t xp_msi_irq_handler_low(int irq, void *data)
         (reg_value[2] == 0) & (reg_value[3] == 0)) {
         return IRQ_HANDLED;
     } else {
-        rc = xp_irq_handler(priv, NUM_LP_INT_REG_BLOCKS, xp_lp_reg_start_bit, 
-                            xp_lp_reg_end_bit, xp_lp_reg_bit_width, reg_value);
+        memset(&intr_info, 0, sizeof(intr_info));
+        intr_info.dev_id = MINOR(priv->cdev.dev);
+        intr_info.reg_type = LOW;
+
+        /* Process reported low priority interrupt */
+        rc = xp_irq_interrupt_process(priv, &intr_info);
         if (rc < 0) {
             pr_err("ERR: Could not handle low prioirty interrupts.\n");
+            return IRQ_NONE;
         }
+        priv->intr_low_prio_block_counter++;
     }
 
     return IRQ_HANDLED;
@@ -1399,6 +1194,10 @@ static long xp_dev_ioctl(struct file *filp,
             priv->sig_info.si_pid = current->tgid;
             priv->app_pid = current->pid;
             pr_debug("Registered Pid = %d\n", priv->app_pid);
+
+            rcu_read_lock();
+            priv->wtask = pid_task(find_pid_ns(priv->app_pid, &init_pid_ns), PIDTYPE_PID);
+            rcu_read_unlock();
             break;
 #ifndef NO_NETDEV
         case INIT_NETDEV:
@@ -1442,6 +1241,10 @@ static long xp_dev_compat_ioctl(struct file *filp,
             priv->sig_info.si_pid = current->tgid;
             priv->app_pid = current->pid;
             pr_debug("Registered Pid = %d\n", priv->app_pid);
+
+            rcu_read_lock();
+            priv->wtask = pid_task(find_pid_ns(priv->app_pid, &init_pid_ns), PIDTYPE_PID);
+            rcu_read_unlock();
             break;
 #ifndef NO_NETDEV
         case INIT_NETDEV:
@@ -1540,7 +1343,10 @@ static int xp_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
             }
         }
     }
-  
+
+    /* Disable relax ordering irrespective of CPU */
+    xp_clear_and_set_pci_capability(priv->pdev, PCI_EXP_DEVCTL, PCI_EXP_DEVCTL_RELAX_EN, 0);
+
     /* Copy DMA mask and other details to dma private strcture. */
     if (!(xp_dma_priv->dev->coherent_dma_mask)) {
         if (priv->pdev->dev.dma_mask) {
@@ -1693,19 +1499,18 @@ static int xp_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     priv->sig_info.si_code  = SI_QUEUE;
     priv->sig_info.si_pid   = current->tgid;
     priv->sig_info.si_int   = 0;
-
+    priv->wtask = NULL;
     priv->app_pid = current->pid;
     priv->xpnet = 0;
-
     spin_lock_init(&priv->tx_dma_read_lock);
 
-    memset(priv->proc_fs_name, 0, sizeof(priv->proc_fs_name));
-    snprintf(priv->proc_fs_name, sizeof(priv->proc_fs_name) - 1, "%s%u",
-             XPREG_PROC_FILE_NAME, minor);
-    priv->reg_proc = xpreg_proc_create(priv->proc_fs_name, NULL, priv);
-    if(NULL == priv->reg_proc){
-        pr_err("XP: xpreg_proc_create failed.\n");
-    }
+    rc = xp_proc_create(priv);
+    if (rc)
+        goto err_device_create;
+
+    /* Read chip version register */
+    xp_dev_reg_read(&priv->chip_version, XP_GET_PCI_BASE_OFFSET_FROM_REG_NAME(SLAVE_CHIP_E,
+            priv->mode), DWORD_SIZE, priv, 1);
 
     if (minor < MAX_DEV_SUPPORTED) {
         xp_pcie_dev_ptr[minor] = priv;
@@ -1717,7 +1522,6 @@ static int xp_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
     pr_info("XP: Pcie Slave Probe successful.\n");
     return 0;
-
 
 err_device_create:
     cdev_del(&priv->cdev);
@@ -1778,14 +1582,7 @@ static void xp_pci_remove(struct pci_dev *pdev)
         destroy_workqueue(priv->w_queue);
     }
 
-    if(NULL != priv->reg_proc){
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,10,0)
-	    proc_remove(priv->reg_proc);
-#else
-	    remove_proc_entry(priv->proc_fs_name, NULL);
-#endif
-    }
-
+    xp_proc_remove(priv);
     kfree(priv);
 
     /* PCIe disable device. */
@@ -2031,6 +1828,7 @@ module_init(xp_module_init);
 module_exit(xp_module_exit);
 module_param(dyn_pcie_dev_id, int, 0);
 module_param(isr_enable, bool, 0);
+module_param(intr_processing_mode, bool, 0);
 
 MODULE_AUTHOR("Xpliant INC Confidential.");
 MODULE_DESCRIPTION("User mode PCIe Endpoint device interface.");

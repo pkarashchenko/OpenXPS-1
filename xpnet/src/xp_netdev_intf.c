@@ -36,6 +36,7 @@
 #include <linux/version.h>
 #include <linux/seq_file.h>
 #include <linux/netdevice.h>
+#include <linux/if_ether.h>
 #include <net/netns/generic.h>
 
 #include <linux/hashtable.h>
@@ -51,11 +52,14 @@
 #define XP_NETLINK_USER     31
 
 #define XP_INVALID_TRAP_ID -1
-#define XP_MAX_REASON_CODE  803
+#define XP_MAX_REASON_CODE  1023
 #define XP_MAX_TRAP_ID      0x5000
 
 #define XP_MIN_FP_INTF      0
 #define XP_MAX_FP_INTF      128
+
+#define XP_CPU_PORT_INTF    135
+#define XP_CPU_PORT_NUM     176
 
 #define XP_MIN_LAG_INTF     4096
 #define XP_MAX_LAG_INTF     5019
@@ -63,6 +67,20 @@
 #define XP_OFFSET_BD_INTF   65536
 #define XP_NUM_RP_INTF      16384
 #define XP_MAX_BD_INTF      (XP_OFFSET_BD_INTF + XP_NUM_RP_INTF)
+
+#define XP_MIN_VLAN_ID      0
+#define XP_MAX_VLAN_ID      4095
+
+#define XP_ETH_TYPE_OFFSET       12
+#define XP_ETH_HDR_LEN           14
+#define XP_ETH_VLAN_TAG_LEN      4
+#define XP_ETH_VLAN_TAG_OFFSET   (XP_ETH_HDR_LEN)
+
+#ifndef NO_FORСED_LEARNING_FROM_UNICAST_ARP
+#define IVIF_SA_MISS             211
+#define ROUTE_NOT_POSSIBLE       312
+#endif /* NO_FORСED_LEARNING_FROM_UNICAST_ARP */
+
 
 typedef struct xp_trap_config
 {
@@ -87,7 +105,8 @@ struct xp_pernet {
 typedef enum xp_netdev_type {
     XP_FP_NETDEV=0,
     XP_ROUTER_NETDEV,
-    XP_LAG_NETDEV
+    XP_LAG_NETDEV,
+    XP_CPU_NETDEV
 } xp_netdev_type;
 
 struct xp_netdev_priv {
@@ -108,15 +127,20 @@ struct xp_netdev_priv {
 };
 
 struct xp_skb_info {
+#ifndef NO_FORСED_LEARNING_FROM_UNICAST_ARP
+    unsigned char learn_from_uc_arp;
+#endif /* NO_FORСED_LEARNING_FROM_UNICAST_ARP */
     unsigned int rc;        /* Reason code                       */
     unsigned int rif_id;    /* Ingress router interaface         */
     unsigned int intf_id;   /* Ingress interface                 */
     unsigned int port_num;  /* Ingress port number               */
+    unsigned short bd_id;   /* Bridge domain ID                  */
     struct sk_buff *skb;    /* Socket buffer the info belongs to */
 };
 
 extern netdev_tx_t xpnet_start_xmit(struct sk_buff *skb, 
                                     xpnet_private_t *net_priv);
+
 
 static LIST_HEAD(xp_netdev_list);
 static DEFINE_RWLOCK(xp_netdev_list_lock);
@@ -147,6 +171,9 @@ static struct socket *client_socket;
 /* Packet mirroring to socket. */
 static int packet_mirroring_enable;
 
+/* XP_NL_HOSTIF_TRAP_NETDEV mode */
+static xp_nl_netdev_mode_t xp_netdev_mode = XP_NL_NETDEV_MODE_1;
+
 static void xp_rx_skb_dump(struct sk_buff *skb)
 {
     if (xp_debug) {
@@ -156,6 +183,8 @@ static void xp_rx_skb_dump(struct sk_buff *skb)
 #endif
     }
 }
+
+
 
 static int xp_trap_init(void)
 {
@@ -290,17 +319,44 @@ static int xp_ndo_stop(struct net_device *dev)
 
     netif_stop_queue(dev);
     return 0;
-} 
+}
+
+/* \func xp_txh_update_bd
+ *
+ * \brief Check Ethernet packet for presence of IEEE 802.1Q header and sets
+ * bdId value in Tx header metadata to value of VID from IEEE 802.1Q header.
+ *
+ * This function is used when driver is operation in XP_NL_NETDEV_MODE_2 mode.
+ * In this mode the CPU kernel netdev interface serves as an aggregate for
+ * L3 VLAN kernel netdevs which are created as VLAN sub-interfaces of the CPU netdev.
+ * The packets that are send out of L3 VLAN interface should be sent by CPU netdev
+ * to the start of pipeline with bdId set to a VLAN tag present in Ethernet packet
+ * so VLAN forwarding will happen according to pipeline configuration.
+ *
+ * \param packet Pointer to the start of RAW Ethernet packet
+ * \param tx_header Pointer to transmission header used for packet send
+ *
+ * */
+static void xp_txh_update_bd(unsigned char *packet, xphTxHdr *tx_header)
+{
+    if ((packet[XP_ETH_TYPE_OFFSET] == 0x81) &&
+        (packet[XP_ETH_TYPE_OFFSET + 1] == 0x00))
+    {
+        tx_header->metadata.setBd = 1;
+        tx_header->metadata.bdId[0] = packet[XP_ETH_VLAN_TAG_OFFSET] & 0x0F;
+        tx_header->metadata.bdId[1] = packet[XP_ETH_VLAN_TAG_OFFSET + 1];
+    }
+}
 
 static netdev_tx_t xp_ndo_start_xmit(struct sk_buff *skb, 
                                      struct net_device *dev) 
 {
     netdev_tx_t rc = NETDEV_TX_OK;
     xphTxHdr *tx_header = NULL;
-    unsigned int new_skb_used = 0;
     unsigned int tx_header_len = sizeof(xphTxHdr);
     unsigned int headroom = skb_headroom(skb);
     struct sk_buff *new_skb = NULL;
+    struct sk_buff *cur_skb = skb;
     struct xp_netdev_priv *priv = NULL;
     unsigned long flags = 0;
 
@@ -315,29 +371,21 @@ static netdev_tx_t xp_ndo_start_xmit(struct sk_buff *skb,
     if (headroom < tx_header_len) {
         /* If called in interrupt shd be changed to GFP_ATOMIC. */
         new_skb = skb_copy_expand(skb, tx_header_len, 0, GFP_ATOMIC);
-        new_skb_used = 1;
+        cur_skb = new_skb;
     } 
 
     /* skb->data will point to xp tx header */
-    if (new_skb_used) {
-        tx_header = (xphTxHdr *)skb_push(new_skb, tx_header_len);
+    tx_header = (xphTxHdr *)skb_push(cur_skb, tx_header_len);
 
-        /* copy xp txheader. Read lock on entry */
-        read_lock_irqsave(&priv->netdev_priv_lock, flags);
-        memcpy(tx_header, &priv->tx_header, sizeof(xphTxHdr));
-        read_unlock_irqrestore(&priv->netdev_priv_lock, flags);
-
-        rc = xpnet_start_xmit(new_skb, g_net_priv);
-    } else {
-        tx_header = (xphTxHdr *)skb_push(skb, tx_header_len);
-
-        /* copy xp txheader. Read lock on entry */
-        read_lock_irqsave(&priv->netdev_priv_lock, flags);
-        memcpy(tx_header, &priv->tx_header, sizeof(xphTxHdr));
-        read_unlock_irqrestore(&priv->netdev_priv_lock, flags);
-        rc = xpnet_start_xmit(skb, g_net_priv);
+    /* copy xp txheader. Read lock on entry */
+    read_lock_irqsave(&priv->netdev_priv_lock, flags);
+    memcpy(tx_header, &priv->tx_header, sizeof(xphTxHdr));
+    if (priv->netdev_type == XP_CPU_NETDEV) {
+        xp_txh_update_bd(cur_skb->data + tx_header_len, tx_header);
     }
+    read_unlock_irqrestore(&priv->netdev_priv_lock, flags);
 
+    rc = xpnet_start_xmit(cur_skb, g_net_priv);
     if (rc == NETDEV_TX_OK) {
         /*
          * Case A:
@@ -356,7 +404,7 @@ static netdev_tx_t xp_ndo_start_xmit(struct sk_buff *skb,
          * Case 2(newSkb not used): If we used fnet skb, free is
          * already handled. No action reqd.
          */
-        if (new_skb_used) {
+        if (new_skb) {
             dev_kfree_skb_any(skb);
         }
 
@@ -371,7 +419,7 @@ static netdev_tx_t xp_ndo_start_xmit(struct sk_buff *skb,
          * skb is not handled now(optimised soln).  Case 2:(newSkb not
          * used): fp skb alloced by kernel. we dont free it(kernel
          * retry). */
-        if (new_skb_used) {
+        if (new_skb) {
             dev_kfree_skb_any(new_skb);
         }
 
@@ -476,7 +524,7 @@ static int xp_nl_msg_if_create(struct net *netns, xp_nl_msg_intf_t *intf_msg)
         }
     }
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3,19,0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,17,0)
     netdev = alloc_netdev(sizeof(struct xp_netdev_priv), 
                           intf_msg->intf_name, xp_netdev_setup);
 #else
@@ -570,6 +618,14 @@ static int xp_nl_msg_if_link(struct net *netns, xp_nl_msg_link_t *link_msg)
                     link_msg->xpnet_intf_id, link_msg->vif);
                 entry->netdev_type = XP_FP_NETDEV;
                 entry->vif = link_msg->vif;
+                hash_add(xp_active_netdev_htable, 
+                         &entry->hlist, XP_VIF_TO_HASH(entry->vif));
+            } else if (XP_CPU_PORT_INTF == link_msg->vif) {
+                LOG("Added CPU netdev interface link, xpnet_id: %u, vif: %u\n", 
+                    link_msg->xpnet_intf_id, link_msg->vif);
+
+                entry->vif = link_msg->vif;
+                entry->netdev_type = XP_CPU_NETDEV;
                 hash_add(xp_active_netdev_htable, 
                          &entry->hlist, XP_VIF_TO_HASH(entry->vif));
             } else if ((XP_OFFSET_BD_INTF <= link_msg->rif) && 
@@ -726,6 +782,55 @@ static int xp_nl_msg_mirror(struct net *netns, xp_nl_msg_mirror_t *mirror_msg)
     return 0;
 }
 
+static int xp_nl_msg_link_status(struct net *netns,
+                                 xp_nl_msg_link_status_t *status_msg)
+{
+    struct list_head *iter = NULL;
+    DBG("Enter: %s\n", __FUNCTION__);
+
+    if ((0 != status_msg->status) && (1 != status_msg->status)) {
+        ERR("Invalid interface status: %u, xpnet_id: %u",
+            status_msg->status, status_msg->xpnet_intf_id);
+
+        return 0;
+    }
+
+    write_lock(&xp_netdev_list_lock);
+    list_for_each(iter, &xp_netdev_list) {
+        struct xp_netdev_priv *entry = list_entry(iter, struct xp_netdev_priv, list);
+
+        if (entry->xpnet_intf_id == status_msg->xpnet_intf_id) {
+            if (status_msg->status) {
+                LOG("Operational status of interface %s (%u) is UP\n",
+                    entry->netdev->name, entry->xpnet_intf_id);
+                netif_carrier_on(entry->netdev);
+            } else {
+                LOG("Operational status of interface %s (%u) is DOWN\n",
+                    entry->netdev->name, entry->xpnet_intf_id);
+                netif_carrier_off(entry->netdev);
+            }
+
+            break;
+        }
+    }
+
+    write_unlock(&xp_netdev_list_lock);
+    return 0;
+}
+
+static int xp_nl_msg_netdev_mode(struct net *netns,
+                                 xp_nl_msg_netdev_mode_t *mode_msg)
+{
+    DBG("Enter: %s\n", __FUNCTION__);
+
+    if (xp_netdev_mode != mode_msg->mode) {
+        xp_netdev_mode = mode_msg->mode;
+        LOG("Set netdev mode to: %u\n", xp_netdev_mode);
+    }
+
+    return 0;
+}
+
 static int xp_nl_msg_process(struct net *netns, void *nl_msg_payload)
 {
     unsigned int offset = 0;
@@ -813,6 +918,24 @@ static int xp_nl_msg_process(struct net *netns, void *nl_msg_payload)
                 xp_nl_msg_mirror_t msg;
                 memcpy(&msg, nl_msg_payload + offset, sizeof(msg));
                 xp_nl_msg_mirror(netns, &msg);
+                offset += sizeof(msg);
+            }
+            break;
+
+            case XP_NL_MSG_LINK_STATUS_SET:
+            {
+                xp_nl_msg_link_status_t msg;
+                memcpy(&msg, nl_msg_payload + offset, sizeof(msg));
+                xp_nl_msg_link_status(netns, &msg);
+                offset += sizeof(msg);
+            }
+            break;
+
+            case XP_NL_MSG_NETDEV_MODE_SET:
+            {
+                xp_nl_msg_netdev_mode_t msg;
+                memcpy(&msg, nl_msg_payload + offset, sizeof(msg));
+                xp_nl_msg_netdev_mode(netns, &msg);
                 offset += sizeof(msg);
             }
             break;
@@ -937,7 +1060,7 @@ static void xp_client_sock_deinit(void)
 
 static void xp_rx_skb_info_get(struct sk_buff *skb, struct xp_skb_info *info) 
 {
-    unsigned int bd_id = 0;
+    unsigned short bd_id = 0;
     unsigned int intf_id = 0;
     xphRxHdr *rx_header = (xphRxHdr *)skb->data;
 
@@ -953,6 +1076,7 @@ static void xp_rx_skb_info_get(struct sk_buff *skb, struct xp_skb_info *info)
     /* bdId */
     bd_id = rx_header->metadata.bdId[0];
     bd_id = ((bd_id << 8) | rx_header->metadata.bdId[1]);
+    info->bd_id = bd_id;
 
     /* Router interface */
     info->rif_id = (bd_id < XP_OFFSET_BD_INTF) ? 
@@ -1016,10 +1140,10 @@ static void xp_rx_skb_fd_process(struct socket *sock,
 #endif
         /* adjust memory boundaries */
         set_fs(KERNEL_DS);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4,1,0)
-        sock_sendmsg(sock, &msg, skb_info->skb->len);
-#else
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,1,0)
         sock_sendmsg(sock, &msg);
+#else
+        sock_sendmsg(sock, &msg, skb_info->skb->len);
 #endif
         set_fs(old_fs);
 
@@ -1039,7 +1163,7 @@ static void xp_rx_skb_netdev_process(struct xp_skb_info *skb_info)
     }
 
     /* Netdev interface doesn't need RX metainfo header.
-       So, let's remove it. */
+     * So, let's remove it. */
     skb_pull(skb_info->skb, sizeof(xphRxHdr));
 
     if (((XP_MIN_FP_INTF <= skb_info->intf_id) && 
@@ -1047,7 +1171,9 @@ static void xp_rx_skb_netdev_process(struct xp_skb_info *skb_info)
 
         ((XP_MIN_LAG_INTF <= skb_info->intf_id) && 
         (skb_info->intf_id < XP_MAX_LAG_INTF))) {
-
+            vif = skb_info->intf_id;
+    } else if ((XP_MIN_FP_INTF <= skb_info->port_num) && 
+               (skb_info->port_num < XP_MAX_FP_INTF)) {
         vif = skb_info->port_num;
     }
 
@@ -1075,6 +1201,100 @@ static void xp_rx_skb_netdev_process(struct xp_skb_info *skb_info)
     read_unlock_irqrestore(&xp_netdev_list_lock, flags);
 }
 
+static unsigned short
+xp_get_eth_type(unsigned char *packet, unsigned char *tagged)
+{
+    unsigned short eth_type;
+
+    eth_type = ((unsigned short)packet[XP_ETH_TYPE_OFFSET] << 8) |
+            packet[XP_ETH_TYPE_OFFSET + 1];
+
+    if (eth_type == ETH_P_8021Q) {
+        *tagged = 1;
+        eth_type = ((unsigned short)packet[XP_ETH_TYPE_OFFSET + XP_ETH_VLAN_TAG_LEN] << 8) |
+                packet[XP_ETH_TYPE_OFFSET + XP_ETH_VLAN_TAG_LEN + 1];
+    } else {
+        *tagged = 0;
+    }
+
+    return eth_type;
+}
+
+static void xp_rx_skb_netdev_process_2(struct xp_skb_info *skb_info)
+{
+    unsigned int vif = XP_NO_VIF;
+    struct xp_netdev_priv *entry = NULL;
+    unsigned long flags = 0;
+    unsigned int bytes_to_pull = sizeof(xphRxHdr);
+    unsigned char *eth_packet = skb_info->skb->data + bytes_to_pull;
+
+    if (packet_mirroring_enable) {
+        xp_rx_skb_fd_process(cb_sock_ptr, skb_info);
+    }
+
+    vif = skb_info->port_num;
+
+    /* Handle case when packet was trapped on L2 or L3 VLAN. */
+    if ((skb_info->bd_id >= XP_MIN_VLAN_ID) &&
+        (skb_info->bd_id <= XP_MAX_VLAN_ID)) {
+        unsigned char tagged = 0;
+        unsigned short eth_type = xp_get_eth_type(eth_packet, &tagged);
+
+        if ((eth_type == ETH_P_IP) || (eth_type == ETH_P_IPV6) ||
+            (eth_type == ETH_P_ARP)) {
+#ifndef NO_FORСED_LEARNING_FROM_UNICAST_ARP
+            if ((eth_type == ETH_P_ARP) && (skb_info->rc == ROUTE_NOT_POSSIBLE) &&
+                (skb_info->learn_from_uc_arp)) {
+                xphRxHdr *rx_header = (xphRxHdr *)skb_info->skb->data;
+                /* Update packet with SA_NEW reason code */
+                rx_header->reasonCodeMSB = IVIF_SA_MISS >> 2;
+                rx_header->reasonCodeLsbs = IVIF_SA_MISS & 3;
+                xp_rx_skb_fd_process(cb_sock_ptr, skb_info);
+                /* Restore original reason code */
+                rx_header->reasonCodeMSB = skb_info->rc >> 2;
+                rx_header->reasonCodeLsbs = skb_info->rc & 3;
+            }
+#endif /* NO_FORСED_LEARNING_FROM_UNICAST_ARP */
+            /* ARP or L3 packet is destined to L3 VLAN netdev which in turn is a
+             * Linux VLAN subinterface of CPU netdev so add a VLAN tag in case
+             * it's missing and set vif to CPU interface ID. L2 packets still
+             * have to be sent to port netdevs. */
+            if (!tagged) {
+                /* Create a place for VLAN header. */
+                unsigned char *new_eth_packet = eth_packet - XP_ETH_VLAN_TAG_LEN;
+                memmove(new_eth_packet, eth_packet, XP_ETH_TYPE_OFFSET);
+
+                /* Place a VLAN header. */
+                new_eth_packet[XP_ETH_TYPE_OFFSET] = (ETH_P_8021Q >> 8) & 0xFF;
+                new_eth_packet[XP_ETH_TYPE_OFFSET + 1] = ETH_P_8021Q & 0xFF;
+                new_eth_packet[XP_ETH_VLAN_TAG_OFFSET] = (skb_info->bd_id >> 8) & 0x0F;
+                new_eth_packet[XP_ETH_VLAN_TAG_OFFSET + 1]  = skb_info->bd_id & 0xFF;
+
+                /* We've used 4 bytes from RX metainfo header so have decrease
+                 * bytes_to_pull correspondingly. */
+                bytes_to_pull -= XP_ETH_VLAN_TAG_LEN;
+            }
+
+            vif = XP_CPU_PORT_INTF;
+        }
+    }
+
+    /* Netdev interface doesn't need RX metainfo header. So, let's remove it.*/
+    skb_pull(skb_info->skb, bytes_to_pull);
+
+    if (XP_NO_VIF != vif) {
+        read_lock_irqsave(&xp_netdev_list_lock, flags);
+        hash_for_each_possible(xp_active_netdev_htable, 
+                               entry, hlist, XP_VIF_TO_HASH(vif)) {
+            if (entry->vif == vif) {
+                xp_rx_netdev_skb_netif_rx(skb_info->skb, entry->netdev);
+                break;
+            }
+        }
+        read_unlock_irqrestore(&xp_netdev_list_lock, flags);
+    }
+}
+
 void xp_rx_skb_process(xpnet_private_t *priv, struct sk_buff *skb) 
 {
     unsigned int trap_id = 0;
@@ -1086,8 +1306,22 @@ void xp_rx_skb_process(xpnet_private_t *priv, struct sk_buff *skb)
 
     priv->stats.rx_packets++;
     priv->stats.rx_bytes += skb->len;
+#ifndef NO_FORСED_LEARNING_FROM_UNICAST_ARP
+    /* Ignore packets that does not meet minimum packet length. */
+    if (skb->len < XPNET_MIN_PACKET_SIZE) {
+        goto out;
+    }
+    /* Should FDB learning event be generated by SW from unicast ARP? */
+    skb_info.learn_from_uc_arp = (priv->pci_priv->mode != XP_A0_UNCOMPRESSED) &&
+            (((priv->pci_priv->chip_version & 0xF0000000) >> 28) == 0);
+#endif /* NO_FORСED_LEARNING_FROM_UNICAST_ARP */
 
     DBG("Trapped packet, RC: %u\n", skb_info.rc);
+
+    /* Ignore packets trapped to CPU with ingress port set to CPU port */
+    if (skb_info.port_num == XP_CPU_PORT_NUM) {
+        goto out;
+    }
 
     trap_id = xp_trap_id_get(skb_info.rc);
     trap_cfg = xp_trap_config_get(trap_id);
@@ -1108,7 +1342,11 @@ void xp_rx_skb_process(xpnet_private_t *priv, struct sk_buff *skb)
             break;
 
         case XP_NL_HOSTIF_TRAP_NETDEV:
-            xp_rx_skb_netdev_process(&skb_info);
+            if (xp_netdev_mode == XP_NL_NETDEV_MODE_1) {
+                xp_rx_skb_netdev_process(&skb_info);
+            } else {
+                xp_rx_skb_netdev_process_2(&skb_info);
+            }
             break;
 
         default:

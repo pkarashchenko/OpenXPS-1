@@ -27,10 +27,9 @@
 #define XP_HP_INT_REG_SIZE_IN_DWRD   4
 #define XP_LP_INT_REG_SIZE_IN_DWRD   3
 
-#define NUM_HP_INT_REG_BLOCKS        35
-#define NUM_LP_INT_REG_BLOCKS        33
 
 #define DMA0_INTR_START_BIT_POS(addr_mode)  ((addr_mode) ? 9 : 8)
+#define MGMT_INTR_BLOCK_MASK(addr_mode)  ((addr_mode) ? 0x1FF : 0xFF)
 
 #define DMA0_TXDONE(reg_addr, qnum)  (reg_addr + 16 * qnum)
 #define DMA0_RXDONE(reg_addr, qnum)  (reg_addr + 16 * qnum)
@@ -82,6 +81,7 @@ typedef enum xp_register {
     CPU_CTRL_REG_E,
     CPU_STS_REG_E,
     SRAM_MEM_CFG_SRAM_EXT_MEM_E,
+    SLAVE_CHIP_E,
 
     XP_MAX_REG_ACCESS_LIST
 } xp_register_t;

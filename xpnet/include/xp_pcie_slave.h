@@ -27,11 +27,25 @@
 
 #include "xp_reg_info.h"
 #include <linux/cdev.h>
+#include "version.h"
 
 #define PROC_FS_NAME_SIZE 50
 #define REG_RW_STATUS_SIZE 200
+#define INTR_CLR_RW_STATUS_SIZE 100
+#define INTR_BLOCK_NAME_SIZE 25
 #define HIGH_INTR_SRC_REG_SIZE 5
  
+#define XP_PROC_FILE_NAME "xppcie"
+
+#define XPREG_PROC_NAME "regaccess"
+#define XPINTR_PROC_NAME "intr_stats"
+#define XPINTR_CLEAR_PROC_NAME "reset_intr_stats"
+
+#define NAME_STR_PCI_TRAN_COUNTER   		"pci-transaction-counter"  /*pci transaction (pci read/write) counter string name macro*/
+#define NAME_STR_HELP      		"help"     /*help string name macro*/
+#define NAME_STR_RST_COUNTER    "reset"    /*reset string name macro*/
+#define NAME_STR_INVALID		"invalid"  /*invalid string name macro*/
+
 /* Register Read/Write */
 typedef struct __attribute__((__packed__)) xp_reg_rw {
     u32 reg_address;  /* Address to read/write */
@@ -70,17 +84,39 @@ typedef struct xp_private {
     /* Lock to make tx DMA and reg read mutual exclusive. */ 
     spinlock_t tx_dma_read_lock;
     pid_t app_pid;
+    /* For holding the task struct of registered Pid */
+    struct task_struct *wtask;
     struct siginfo sig_info;
 
     /* Device type with mode(compress or uncompress). */
     xp_address_mode_t mode;
+    /* Chip version */
+    u32 chip_version;
 
-    /* For storing PDE entry */
+    /* PDE for root xppcie node */
+    struct proc_dir_entry *proc_root;
+    /* For storing PDE entry for intr */
+    struct proc_dir_entry *intr_proc;
+    /* For storing PDE entry for reg */
     struct proc_dir_entry *reg_proc;
-    /* For storing PDE name */
-    char proc_fs_name[PROC_FS_NAME_SIZE];
-    /* For storing reg read/write status */
+    /* For storing PDE entry for clear_intr */
+    struct proc_dir_entry *clr_intr_proc;
+
+    /* For storing reg proc read/write status */
     char reg_rw_status[REG_RW_STATUS_SIZE];
+    /* Register read counter */
+    u64 reg_read_count;
+    /* Register write counter */
+    u64 reg_write_count;
+
+    /* For storing intr proc read/write status */
+    char clr_intr_rw_status[INTR_CLR_RW_STATUS_SIZE];
+    /* high priority block interrupt counter */
+    u64 intr_high_prio_block_counter;
+    /* low priority block interrupt counter */
+    u64 intr_low_prio_block_counter;
+    /* high priority mgmt (dma0) interrupt counter */
+    u64 intr_high_prio_mgmt_counter;
 } xp_private_t;
 
 #endif /* _XP_PCIE_SLAVE_H */

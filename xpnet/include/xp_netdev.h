@@ -36,6 +36,7 @@
 #include "xp_reg_info.h"
 
 #define XPNET_NUM_QUEUES             	(64)
+#define XPNET_DESC_CHAIN_COUNT			(1)
 #define XPNET_RX_NUM_QUEUES             (64)
 #define XPNET_RX_NUM_DESCS              (10)
 #define XPNET_TX_NUM_QUEUES             (64)
@@ -43,6 +44,9 @@
 #define XPNET_MAX_DMA_SEGMENT_SIZE      (4 << 10)
 #define XPNET_DESC_SIZE                 (sizeof(xpnet_descriptor_t))
 #define XPNET_MAX_ATTEMPTS              (50)
+
+#define XPNET_MAX_PACKET_SIZE           (16 << 10)
+#define XPNET_MIN_PACKET_SIZE           (60 + 24)
 
 #define XPNET_PROC_FILE_NAME            "xpnet"
 #define XPNET_PROC_FILE_PATH            "/proc/" XPNET_PROC_FILE_NAME
@@ -56,6 +60,16 @@
 #define XPNET_CEIL_LEN(len, align)\
 ({\
     ((len + align - 1) & ~(align - 1));\
+})
+
+#define XPNET_DESC_CHAIN_INDEX(desc_idx)\
+({\
+    (desc_idx / XPNET_RX_NUM_DESCS);\
+})
+
+#define XPNET_DESC_INDEX_IN_CHAIN(desc_idx)\
+({\
+    (desc_idx % XPNET_RX_NUM_DESCS);\
 })
 
 #define xpnet_decr_and_wrap(idx, limit)\
@@ -128,6 +142,8 @@ typedef struct xpnet_queue_struct {
     u32 xpq_id;            /* ID of the queue                               */
     xpnet_enum_t xpq_type; /* Enum RX/TX                                    */
     u32 xpq_num_desc;      /* Elements on xpq_desc                          */
+    u32 xpq_deschain_idx;  /* Current deschain busy in processing            */
+    u32 xpq_next_deschain_idx;  /* Current deschain busy in receiving            */
     int status;            /* Stopped, active, etc                          */
     int tail;              /* Index where producer function operates on     */
     int head;              /* Index where consumer function operates on     */
@@ -135,8 +151,25 @@ typedef struct xpnet_queue_struct {
     dma_addr_t dma;        /* DMA address of the start of descriptor chain  */
 
     /* Metadata of the descriptors */
-    xpnet_desc_struct_t xpq_desc_meta[XPNET_RX_NUM_DESCS];
+    xpnet_desc_struct_t xpq_desc_meta[XPNET_DESC_CHAIN_COUNT][XPNET_RX_NUM_DESCS];
 } xpnet_queue_struct_t;
+
+typedef struct xpnet_tx_queue_struct {
+/* Metadata required for book-keeping of the queue                          */
+    spinlock_t xpq_lock;   /* Lock for this queue access                    */
+    u32 xpq_id;            /* ID of the queue                               */
+    xpnet_enum_t xpq_type; /* Enum RX/TX                                    */
+    u32 xpq_num_desc;      /* Elements on xpq_desc                          */
+    u32 xpq_deschain_idx;  /* Current deschain busy in receiving            */
+    int status;            /* Stopped, active, etc                          */
+    int tail;              /* Index where producer function operates on     */
+    int head;              /* Index where consumer function operates on     */
+    void *va;              /* VA of the start of descriptor chain           */
+    dma_addr_t dma;        /* DMA address of the start of descriptor chain  */
+
+    /* Metadata of the descriptors */
+    xpnet_desc_struct_t xpq_desc_meta[XPNET_TX_NUM_DESCS];
+} xpnet_tx_queue_struct_t;
 
 typedef struct xpnet_private {
     u32 hw_flags;            /* 32 bits h/w specific  usage, e.g., revision */
@@ -151,7 +184,7 @@ typedef struct xpnet_private {
 
     /* RX descritpr ring for queues */
     xpnet_queue_struct_t rx_queue[XPNET_RX_NUM_QUEUES];
-    xpnet_queue_struct_t tx_queue[XPNET_RX_NUM_QUEUES];
+    xpnet_tx_queue_struct_t tx_queue[XPNET_TX_NUM_QUEUES];
     int num_rxqueues, num_txqueues; /* Number of queues enabled              */
 
     int txqno, rxqno;               /* CPU RX and TX queue numbers.          */
@@ -161,7 +194,7 @@ typedef struct xpnet_private {
     struct net_device_stats stats;  /* Netdev structure for DMA statastic    */
     int instance;                                             /* Instance number */
     struct proc_dir_entry *proc_root;     		      /* PDE for root xpnet node  */
-    struct proc_dir_entry *proc_que[XPNET_RX_NUM_QUEUES];     /* PDE for all 64 queues */
+    struct proc_dir_entry *proc_que[XPNET_NUM_QUEUES];     /* PDE for all 64 queues */
     struct proc_dir_entry *proc_stats;                        /* PDE for stats */
     struct proc_dir_entry *proc_ttable;                       /* PDE for trap table */
     struct proc_dir_entry *proc_debug;                             /* PDE for debug mode */
